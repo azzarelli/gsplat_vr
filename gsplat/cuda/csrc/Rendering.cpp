@@ -790,7 +790,8 @@ Rasterization3DGSResult rasterization_3dgs(
     bool return_normals,
     int64_t renderer_config,
     const at::optional<std::string> &process_group_name,
-    int64_t world_size
+    int64_t world_size,
+    bool stereo
 )
 {
     DEVICE_GUARD(means);
