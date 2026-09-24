@@ -643,6 +643,71 @@ namespace
         return clamp_after_bias ? at::clamp_min(values, 0.0) : values;
     }
 
+    // Stereo: evaluate SH once per unique Gaussian from a single viewpoint
+    // midway between the eyes, then scatter to both eyes' packed entries.
+    // A Gaussian visible to both eyes otherwise has its SH evaluated twice,
+    // once per (camera, gaussian) entry in the packed list.
+    //
+    // Both eyes get identical view-dependent colour. That removes the
+    // inter-ocular specular difference, which is a real (if usually small)
+    // stereo depth cue, so this is a quality trade and not a free win.
+    at::Tensor evaluate_feature_sh_stereo_shared(
+        int64_t degree,
+        const at::Tensor &coeffs,
+        const at::Tensor &means,
+        const at::Tensor &viewmats,     // [C, 4, 4], C == 2
+        const at::Tensor &gaussian_ids, // [nnz]
+        bool clamp_after_bias
+    )
+    {
+        // SH only reads the camera centre (c = -R^T t), so take eye 0's matrix
+        // and replace its translation with the midpoint centre.
+        at::Tensor vm      = viewmats.reshape({-1, 4, 4});
+        at::Tensor rot     = vm.slice(1, 0, 3).slice(2, 0, 3);
+        at::Tensor trans   = vm.slice(1, 0, 3).select(2, 3);
+        at::Tensor centres = -at::matmul(rot.transpose(1, 2), trans.unsqueeze(-1)).squeeze(-1);
+        at::Tensor c_mid   = centres.mean(0);
+
+        at::Tensor cyc = vm.slice(0, 0, 1).clone();
+        cyc.slice(1, 0, 3)
+            .select(2, 3)
+            .copy_(-at::matmul(rot.select(0, 0), c_mid.unsqueeze(-1)).squeeze(-1).unsqueeze(0));
+
+        // Union of the two eyes' survivors, and the map from each packed entry
+        // into it. The packed projection emits gaussian ids ascending within
+        // each camera, so the list is two sorted runs and a general sort is
+        // wasted work -- a presence mask over N gives the same union (nonzero
+        // returns ascending indices) about three times faster.
+        const int64_t n_gaussians = means.size(-2);
+        at::Tensor seen           = at::zeros({n_gaussians}, gaussian_ids.options().dtype(at::kBool));
+        seen.index_put_({gaussian_ids}, at::ones({}, seen.options()));
+        at::Tensor uniq = seen.nonzero().squeeze(-1);
+
+        at::Tensor slot = at::empty({n_gaussians}, gaussian_ids.options());
+        slot.index_put_({uniq}, at::arange(uniq.size(0), slot.options()));
+        at::Tensor inverse = slot.index({gaussian_ids});
+
+        at::Tensor zeros_u = at::zeros_like(uniq);
+        at::Tensor values  = spherical_harmonics(
+            degree,
+            means,
+            cyc,
+            coeffs.index({uniq}),
+            c10::nullopt,
+            zeros_u, // batch_ids  (B == 1 on this path)
+            zeros_u, // camera_ids (the single cyclopean camera)
+            uniq,
+            c10::nullopt
+        );
+        // In-place so the bias and clamp do not each allocate a fresh [U, D].
+        values.add_(0.5);
+        if(clamp_after_bias)
+        {
+            values.clamp_min_(0.0);
+        }
+        return values.index({inverse});
+    }
+
     at::Tensor append_depth_channel(const at::Tensor &features, const at::Tensor &depths, bool use_hit_distance)
     {
         at::Tensor depth_channel = use_hit_distance ? at::zeros_like(depths) : depths;
@@ -1147,8 +1212,24 @@ Rasterization3DGSResult rasterization_3dgs(
             TORCH_CHECK(colors.has_value(), "colors must be provided for color render modes");
             // Colors are post-activation values unless an SH degree is provided.
             // SH color output is clamped after the +0.5 color bias.
+            // Shared-SH stereo needs the packed layout (so there is a
+            // gaussian_id per entry to deduplicate on), exactly two cameras,
+            // and a single batch, since the cyclopean viewpoint is only
+            // meaningful for one stereo pair.
+            const bool sh_stereo_shared
+                = stereo && packed && !distributed && C == 2 && B == 1 && sh_degree >= 0 && gaussian_ids_opt.has_value();
+
             at::Tensor projected_colors
-                = sh_degree >= 0 ? maybe_evaluate_feature_sh(
+                = sh_stereo_shared
+                    ? evaluate_feature_sh_stereo_shared(
+                          sh_degree,
+                          colors.value(),
+                          means,
+                          proj_viewmats,
+                          gaussian_ids_opt.value(),
+                          true // clamp_after_bias
+                      )
+                : sh_degree >= 0 ? maybe_evaluate_feature_sh(
                                        sh_degree,
                                        colors.value(),
                                        means,
