@@ -366,8 +366,6 @@ RasterizationOutputs rasterization_3dgs(
         tile_size,
         tile_width,
         tile_height,
-        near_plane,
-        far_plane,
         &timer
     );
     at::Tensor isect_offsets = intersect_offset(isects.isect_ids, C, tile_width, tile_height);

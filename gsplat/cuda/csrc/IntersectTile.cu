@@ -20,7 +20,6 @@
 #include <ATen/core/Tensor.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cassert>
-#include <cmath>
 #include <cooperative_groups.h>
 #include <cuda/std/functional>
 #include <tuple>
@@ -39,6 +38,8 @@
 namespace gsplat
 {
 namespace cg = cooperative_groups;
+
+constexpr unsigned int kIntersectThreads = 256;
 
 #define CUB_WRAPPER_ASYNC(stream, func, ...)                                         \
     do                                                                               \
@@ -254,9 +255,8 @@ __global__ void intersect_tile_kernel(
     const uint32_t tile_height,
     const uint32_t tile_bits,
     const uint32_t depth_bits,
-    const float log_near,    // compact keys: depth code = (log(depth) - log_near) * depth_scale
-    const float depth_scale, // clamped to [0, max_code]
-    const float max_code,
+    const float max_code,               // compact keys: largest depth code
+    uint32_t *__restrict__ depth_range, // compact keys: [~min, max] depth bits, pass 1 reduces, pass 2 reads
     const int64_t key_start,
     const int64_t key_end,
     const bool *__restrict__ tile_mask,    // [I, tile_height, tile_width] optional
@@ -268,6 +268,28 @@ __global__ void intersect_tile_kernel(
     // parallelize over I * N.
     uint32_t idx    = cg::this_grid().thread_rank();
     bool first_pass = cum_tiles_per_gauss == nullptr;
+
+    // Compact keys quantise log-depth over this frame's depth range, which
+    // pass 1 measures over every projected entry (a superset of those that
+    // emit keys). The min is kept as max(~bits) so both reduce with atomicMax
+    // from a zeroed buffer. Before any early return: the whole block reduces.
+    if(first_pass && depth_range != nullptr)
+    {
+        const int64_t e     = static_cast<int64_t>(idx) + offset;
+        const bool visible  = idx < count && radii[e * 2] > 0 && radii[e * 2 + 1] > 0;
+        const uint32_t bits = visible ? __float_as_uint(static_cast<float>(depths[e])) : 0u;
+        auto max_op         = [](uint32_t a, uint32_t b) { return a > b ? a : b; };
+        using BlockReduce   = cub::BlockReduce<uint32_t, kIntersectThreads>;
+        __shared__ typename BlockReduce::TempStorage reduce_storage[2];
+        const uint32_t max_bits     = BlockReduce(reduce_storage[0]).Reduce(bits, max_op);
+        const uint32_t inv_min_bits = BlockReduce(reduce_storage[1]).Reduce(visible ? ~bits : 0u, max_op);
+        if(threadIdx.x == 0)
+        {
+            atomicMax(&depth_range[0], inv_min_bits);
+            atomicMax(&depth_range[1], max_bits);
+        }
+    }
+
     if(idx >= count)
     {
         return;
@@ -301,7 +323,10 @@ __global__ void intersect_tile_kernel(
         const float depth_f = static_cast<float>(depths[idx]);
         if constexpr(std::is_same_v<KeyT, uint32_t>)
         {
-            depth_enc = static_cast<uint32_t>(fminf(fmaxf((__logf(depth_f) - log_near) * depth_scale, 0.f), max_code));
+            const float log_min = __logf(fmaxf(__uint_as_float(~depth_range[0]), 1e-6f));
+            const float span    = __logf(__uint_as_float(depth_range[1])) - log_min;
+            const float scale   = span > 0.f ? max_code / span : 0.f;
+            depth_enc = static_cast<uint32_t>(fminf(fmaxf((__logf(depth_f) - log_min) * scale, 0.f), max_code));
         }
         else
         {
@@ -501,8 +526,7 @@ void launch_intersect_tile_kernel(
     const uint32_t tile_size,
     const uint32_t tile_width,
     const uint32_t tile_height,
-    const float near_plane,
-    const float far_plane,
+    const at::optional<at::Tensor> depth_range,         // [2] int32, compact keys only
     const at::optional<at::Tensor> cum_tiles_per_gauss, // [..., N] or [nnz]
     // outputs
     at::optional<at::Tensor> tiles_per_gauss, // [..., N] or [nnz]
@@ -543,14 +567,10 @@ void launch_intersect_tile_kernel(
         ")."
     );
 
-    // Compact keys map log-depth over [near, far] onto [0, max_code].
-    const float near_clamped = std::max(near_plane, 1e-6f);
-    TORCH_CHECK(far_plane > near_clamped, "intersect_tile: far_plane must exceed near_plane");
-    const float log_near    = std::log(near_clamped);
-    const float max_code    = static_cast<float>((uint64_t{1} << layout.depth_bits) - 1);
-    const float depth_scale = max_code / (std::log(far_plane) - log_near);
+    TORCH_CHECK(layout.compact == depth_range.has_value(), "compact keys need a depth_range buffer, wide keys none");
+    const float max_code = static_cast<float>((uint64_t{1} << layout.depth_bits) - 1);
 
-    constexpr unsigned int threads = 256;
+    constexpr unsigned int threads = kIntersectThreads;
     unsigned int blocks            = static_cast<unsigned int>(::cuda::ceil_div<int64_t>(n_elements, threads));
 
     if(n_elements == 0)
@@ -587,9 +607,9 @@ void launch_intersect_tile_kernel(
                     tile_height,
                     layout.tile_bits,
                     layout.depth_bits,
-                    log_near,
-                    depth_scale,
                     max_code,
+                    depth_range.has_value() ? reinterpret_cast<uint32_t *>(depth_range.value().data_ptr<int32_t>())
+                                            : nullptr,
                     key_start,
                     key_end,
                     tile_mask.has_value() ? tile_mask.value().const_data_ptr<bool>() : nullptr,

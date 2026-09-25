@@ -39,8 +39,6 @@ TileIntersectResult intersect_tile(
     int64_t tile_size,
     int64_t tile_width,
     int64_t tile_height,
-    double near_plane,
-    double far_plane,
     StageTimer *timer
 )
 {
@@ -67,6 +65,12 @@ TileIntersectResult intersect_tile(
     // offset. Reading the total back is a host sync.
     at::Tensor tiles_per_gauss = at::empty_like(depths, opt.dtype(at::kInt));
     at::Tensor cum_tiles_per_gauss;
+    // [~min, max] depth bits of the entries, measured by pass 1 for compact keys
+    at::optional<at::Tensor> depth_range;
+    if(layout.compact)
+    {
+        depth_range = at::zeros({2}, opt.dtype(at::kInt));
+    }
     int64_t n_isects = 0;
     if(n_elements)
     {
@@ -82,8 +86,7 @@ TileIntersectResult intersect_tile(
             tile_size,
             tile_width,
             tile_height,
-            near_plane,
-            far_plane,
+            depth_range,
             c10::nullopt, // cum_tiles_per_gauss
             tiles_per_gauss,
             c10::nullopt, // isect_ids
@@ -116,8 +119,7 @@ TileIntersectResult intersect_tile(
         tile_size,
         tile_width,
         tile_height,
-        near_plane,
-        far_plane,
+        depth_range,
         cum_tiles_per_gauss,
         c10::nullopt, // tiles_per_gauss
         isect_ids,

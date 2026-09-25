@@ -31,8 +31,8 @@ class StageTimer;
 // isect_ids pack [image | tile | depth] so a single radix sort orders entries
 // by image, then tile, then front-to-back. If the image and tile ids leave at
 // least kMinDepthBits of a 32-bit key, keys are compact: 32 bits, with
-// log-depth between the near and far planes quantised into the rest. Else
-// they are 64-bit with the depth's float bits in the low 32.
+// log-depth over the frame's measured depth range quantised into the rest.
+// Else they are 64-bit with the depth's float bits in the low 32.
 constexpr uint32_t kMinDepthBits = 14;
 
 struct KeyLayout
@@ -77,8 +77,6 @@ TileIntersectResult intersect_tile(
     int64_t tile_size,
     int64_t tile_width,
     int64_t tile_height,
-    double near_plane, // depth range of compact keys
-    double far_plane,
     StageTimer *timer = nullptr
 );
 
@@ -98,8 +96,7 @@ void launch_intersect_tile_kernel(
     const uint32_t tile_size,
     const uint32_t tile_width,
     const uint32_t tile_height,
-    const float near_plane,
-    const float far_plane,
+    const at::optional<at::Tensor> depth_range, // [2] int32, compact keys only
     const at::optional<at::Tensor> cum_tiles_per_gauss, // [..., N] or [nnz]
     // outputs
     at::optional<at::Tensor> tiles_per_gauss, // [..., N] or [nnz]
