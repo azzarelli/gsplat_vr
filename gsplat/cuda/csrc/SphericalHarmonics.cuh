@@ -18,25 +18,10 @@
 
 #pragma once
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
-
 #include "Common.h"
 
 namespace gsplat
 {
-namespace sh_cg = cooperative_groups;
-
-__device__ __forceinline__ bool reduce_view_direction_channels(const int64_t elem_id, vec3 &v_dir)
-{
-    auto active_threads = sh_cg::coalesced_threads();
-    auto elem_threads   = sh_cg::labeled_partition(active_threads, static_cast<int>(elem_id));
-    v_dir.x             = sh_cg::reduce(elem_threads, v_dir.x, sh_cg::plus<float>());
-    v_dir.y             = sh_cg::reduce(elem_threads, v_dir.y, sh_cg::plus<float>());
-    v_dir.z             = sh_cg::reduce(elem_threads, v_dir.z, sh_cg::plus<float>());
-    return elem_threads.thread_rank() == 0;
-}
-
 __device__ __forceinline__ vec3 camera_offset_from_world_to_camera(
     const float *__restrict__ viewmat, const float *__restrict__ viewmat_rs = nullptr
 )

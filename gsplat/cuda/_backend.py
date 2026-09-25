@@ -14,28 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Loads the compiled extension: a setup.py build if present, else JIT.
+
+Force a (verbose) JIT build with:
+    VERBOSE=1 TORCH_CUDA_ARCH_LIST="8.6" python -c "from gsplat.cuda._backend import _C"
 """
-Trigger compiling (for debugging):
-
-VERBOSE=1 DEBUG=1 TORCH_CUDA_ARCH_LIST="8.9" python -c "from gsplat.cuda._backend import _C"
-"""
-
-from gsplat._lazy_backend import cuda_toolkit_available
-from .build import build_and_load_gsplat
-from rich.console import Console
-
-_C = None
 
 try:
-    # Try to import the compiled module (via setup.py or pre-built .so)
     from gsplat import csrc as _C
 except ImportError:
-    # if that fails, try with JIT compilation
-    if cuda_toolkit_available():
-        _C = build_and_load_gsplat()
-    else:
-        Console().print(
-            "[yellow]gsplat: No CUDA toolkit found. gsplat will be disabled.[/yellow]"
-        )
+    from .build import build_and_load_gsplat
+
+    _C = build_and_load_gsplat()
 
 __all__ = ["_C"]

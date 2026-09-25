@@ -29,22 +29,12 @@ namespace gsplat
 //
 // Some Macros.
 //
-#define CHECK_DEVICE(x)     TORCH_CHECK(x.is_cuda() || x.is_privateuseone(), #x " must be a CUDA or PrivateUse1 tensor")
+#define CHECK_DEVICE(x)     TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x) \
     CHECK_DEVICE(x);   \
     CHECK_CONTIGUOUS(x)
-// Kernels index raw dense storage; a strided (non-sparse) layout is required.
-#define CHECK_DENSE(x)     TORCH_CHECK(x.layout() == c10::kStrided, #x " must be a dense tensor")
 #define DEVICE_GUARD(_ten) const at::OptionalDeviceGuard device_guard(device_of(_ten));
-
-// Host/device qualifier for helpers shared between host (tests, host-side
-// setup) and device code. Expands to nothing under a non-CUDA compiler.
-#ifdef __CUDACC__
-#    define GSPLAT_HOST_DEVICE __host__ __device__
-#else
-#    define GSPLAT_HOST_DEVICE
-#endif
 
 // https://github.com/pytorch/pytorch/blob/233305a852e1cd7f319b15b5137074c9eac455f6/aten/src/ATen/cuda/cub.cuh#L38-L46
 // handle the temporary storage and 'twice' calls for cub API
@@ -69,22 +59,12 @@ using mat3   = glm::mat<3, 3, float>;
 using mat4   = glm::mat<4, 4, float>;
 using mat3x2 = glm::mat<3, 2, float>;
 
-//
-// Legacy Camera Types
-//
+// Only PINHOLE is used; the projection kernels still switch on the others.
 enum CameraModelType
 {
     PINHOLE = 0,
     ORTHO   = 1,
     FISHEYE = 2,
-    FTHETA  = 3,
-    LIDAR   = 4,
-};
-
-enum RendererConfig
-{
-    MIXED_BATCH    = 0,
-    PARALLEL_BATCH = 1,
 };
 
 #define N_THREADS_PACKED 256
@@ -97,19 +77,12 @@ constexpr uint32_t kMaxCudaGridDimY = 65535;
 #define ALPHA_THRESHOLD         (1.f / 255.f)
 // GAUSSIAN_EXTEND determines where the gaussian is truncated in standard deviations."
 #define GAUSSIAN_EXTEND         3.33f
-// MAX_ALPHA and TRANSMITTANCE_THRESHOLD are chosen so that the equivalent of
-// a maximal opacity Gaussian has to be rasterized twice to reach the threshold,
-// without getting the transmittance too small for numerical stability of
-// the backward pass.
-// i.e. TRANSMITTANCE_THRESHOLD = (1 - MAX_ALPHA)^2
+// A maximal-opacity Gaussian has to be hit twice to reach the threshold:
+// TRANSMITTANCE_THRESHOLD = (1 - MAX_ALPHA)^2
 #define MAX_ALPHA               0.99f
 #define TRANSMITTANCE_THRESHOLD 1e-4f
 
 // Floor for the antialiased compensation factor (sqrt(det_orig / det_blur)).
 // Prevents compensation from reaching zero for extremely small Gaussians.
 #define MIN_COMPENSATION 0.005f
-
-// Floor for (1 - alpha) when computing 1/(1-alpha) in backward rasterization.
-// Prevents gradient explosion when alpha approaches 1.0.
-#define MIN_ONE_MINUS_ALPHA 1e-6f
 } // namespace gsplat

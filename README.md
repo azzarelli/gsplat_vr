@@ -1,146 +1,61 @@
-# gsplat
+# gsplat (stereo-lean)
 
-[![Core Tests.](https://github.com/nerfstudio-project/gsplat/actions/workflows/core_tests.yml/badge.svg?branch=main)](https://github.com/nerfstudio-project/gsplat/actions/workflows/core_tests.yml)
-[![Docs](https://github.com/nerfstudio-project/gsplat/actions/workflows/doc.yml/badge.svg?branch=main)](https://github.com/nerfstudio-project/gsplat/actions/workflows/doc.yml)
+A forward-only trim of [gsplat](https://github.com/nerfstudio-project/gsplat)
+1.6.0 trunk, kept to what real-time stereo rendering of 3DGS needs. The full
+library (training, backward passes, 2DGS, 3DGUT, lidar, sparse, multi-GPU)
+is on the `uwgs-fork` branch.
 
-[http://www.gsplat.studio/](http://www.gsplat.studio/)
+Output is bit-identical to `uwgs-fork` for the kept paths.
 
-gsplat is an open-source library for CUDA accelerated rasterization of gaussians with python bindings. It is inspired by the SIGGRAPH paper [3D Gaussian Splatting for Real-Time Rendering of Radiance Fields](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/), but we’ve made gsplat even faster, more memory efficient, and with a growing list of new features! 
-
-<div align="center">
-  <video src="https://github.com/nerfstudio-project/gsplat/assets/10151885/64c2e9ca-a9a6-4c7e-8d6f-47eeacd15159" width="100%" />
-</div>
-
-## News
-
-### v1.6.0
-
-Changes on `main` since the [v1.5.3](https://github.com/nerfstudio-project/gsplat/releases/tag/v1.5.3) tag (not yet on PyPI).
-
-- [Aug 2026] **Spherical-harmonics updates** -- split diffuse and view-dependent operators, fused view-direction computation, and optimized backward kernels.
-- [Jul 2026] **Sparse 3DGS rasterization** -- active-tile rendering with forward/backward support and sparse Gaussian ID, count, and top-contributor queries.
-- [Jul 2026] **Multi-GPU dense 3DGS** -- distributed support for the dense rendering path.
-- [Jul 2026] **PPISP across densification strategies** -- post-processing now works with both the default and MCMC strategies.
-- [Jul 2026] **Additional performance and code improvements**:
-  - **Faster 3DGS and 3DGUT kernels** -- optimized dense rasterization, spherical-harmonics feature assembly, and projection across sensor models.
-  - **Orthographic-camera support** for 3DGUT.
-  - **Fused SE(3) operations** for pose composition and trajectory interpolation.
-  - **More configurable MCMC operations** for perturbation and relocation.
-  - **PyTorch 2.7+ is now required**, with improved CUDA 12.8 and 13.2 build compatibility.
-- [Jun 2026] **G-SHARP** -- dynamic surgical-scene reconstruction for Gaussian splatting.
-- [Jun 2026] **New camera & sensor support** in the sensors library: pinhole, FTheta, fisheye, and LiDAR models.
-- [Jun 2026] **Faster rasterization** -- a series of performance improvements across the 3DGS and 3DGUT rasterization paths. Noticing roughly 30% improvement on the 3DGUT MCMC path on an NVIDIA A100.
-- [Jun 2026] **Gaussian ID rasterization** -- a new op to rasterize Gaussian IDs, counts, and top contributors per pixel.
-- [Jun 2026] **Various performance and code improvements**:
-  - **Spherical-harmonics improvements** -- support for arbitrary channel counts and fp16.
-  - **Profiling and tracing tools** for diagnosing performance.
-  - **Robustness and stability fixes** across the library.
-  - **Stronger test coverage**, plus ahead-of-time (AOT) build/test CI.
-  - **CUDA 13 and NumPy 2 support**.
-  - **Simplified package layout** -- everything now lives under the `gsplat` namespace.
-- [May 2026] **Inference Rendering (HiGS)** -- An experimental inference-only rendering path based on HiGS (Hierarchically Tiled Gaussian Splatting) is now available under the `experimental` package. The inference path uses macro-tile fused rasterization with fp16 scene packing for low-latency rendering of pre-trained Gaussian scenes. For more details, see the [Inference Rendering](#inference-rendering) section and the [HiGS project page](https://research.nvidia.com/labs/sil/projects/higs/).
-- [May 2026] Native CUDA **MCMC perturb** (`inject_noise`) speeds up the noise-injection step used in MCMC-style Gaussian optimization.
-- [Apr 2026] **AccuTile** adds a conservative ellipse-based tile–Gaussian intersection test on the 3DGS path for tighter work scheduling before rasterization ([PR #927](https://github.com/nerfstudio-project/gsplat/pull/927)).
-- [Apr 2026] **NCore v4** capture support, including richer camera models and point-cloud loading via `PointCloudsSourceProtocol`. See the [NCore example](https://docs.gsplat.studio/main/examples/ncore.html).
-- [Mar 2026] **LiDAR** rasterization for 3D Gaussian splatting: spinning-lidar camera models, `eval3d` rendering, depth / hit-distance modes, and related tooling (optional SciPy via `pip install "gsplat[lidar]"`).
-- [Mar 2026] **TorchScript-oriented** deployment: camera models and distortions are also available through PyTorch **custom operators** and **custom classes**, not only Python callables.
-- [Mar 2026] **3DGUT** extensions: [external distortion](https://github.com/nerfstudio-project/gsplat/pull/886) (e.g. windshield-style rigs), optional **per-ray** inputs with gradients, optional **ray-normal** outputs, and refactored render modes / extra signals (see [3DGUT notes](docs/3dgut.md)).
-- [Jan 2026] [PPISP](https://research.nvidia.com/labs/sil/projects/ppisp/) is integrated as an alternative way of bilateral grid to compensate the training views.
-
-### v1.5.3
-
-- [May 2025] Arbitrary batching (over multiple scenes and multiple viewpoints) is supported now!! Checkout the [batching guide](docs/batch.md) for more details! Kudos to [Junchen Liu](https://junchenliu77.github.io/).
-- [May 2025] [Jonathan Stephens](https://x.com/jonstephens85) makes a great [tutorial video](https://www.youtube.com/watch?v=ACPTiP98Pf8) for Windows users on how to install gsplat and get start with 3DGUT.
-- [April 2025] [NVIDIA 3DGUT](https://research.nvidia.com/labs/toronto-ai/3DGUT/) is now integrated in gsplat! Checkout the [3DGUT integration guide](docs/3dgut.md) for more details. [[NVIDIA Tech Blog]](https://developer.nvidia.com/blog/revolutionizing-neural-reconstruction-and-rendering-in-gsplat-with-3dgut/) [[NVIDIA Sweepstakes]](https://www.nvidia.com/en-us/research/3dgut-sweepstakes/)
-
-## Installation
-
-**Dependence**: Please install [Pytorch](https://pytorch.org/get-started/locally/) first.
-
-The easiest way is to install from PyPI. In this way it will build the CUDA code **on the first run** (JIT).
-
-```bash
-pip install gsplat
-```
-
-Alternatively you can install gsplat from source. In this way it will build the CUDA code during installation.
-
-```bash
-pip install git+https://github.com/nerfstudio-project/gsplat.git
-```
-
-We also provide [pre-compiled wheels](https://docs.gsplat.studio/whl) for both linux and windows on certain python-torch-CUDA combinations (please check first which versions are supported). Note this way you would have to manually install [gsplat's dependencies](https://github.com/nerfstudio-project/gsplat/blob/6022cf45a19ee307803aaf1f19d407befad2a033/setup.py#L115). For example, to install gsplat for pytorch 2.0 and cuda 11.8 you can run
-```
-pip install ninja numpy jaxtyping rich
-pip install gsplat --index-url https://docs.gsplat.studio/whl/pt20cu118
-```
-
-To build gsplat from source on Windows, please check [this instruction](docs/INSTALL_WIN.md).
-
-## Evaluation
-
-This repo comes with a standalone script that reproduces the official Gaussian Splatting with exactly the same performance on PSNR, SSIM, LPIPS, and converged number of Gaussians. Powered by gsplat’s efficient CUDA implementation, the training takes up to **4x less GPU memory** with up to **15% less time** to finish than the official implementation. Full report can be found in the [evaluation results](https://docs.gsplat.studio/main/tests/eval.html).
-
-```bash
-python -m pip install -e .
-cd examples
-python -m pip install -r requirements.txt
-# download mipnerf_360 benchmark data
-python datasets/download_dataset.py
-# run batch evaluation
-bash benchmarks/basic.sh
-```
-
-## Examples
-
-We provide a set of examples to get you started! Below you can find the details about
-the examples (requires installing some extra dependencies via `pip install -r examples/requirements.txt --no-build-isolation`)
-
-- [Train a 3D Gaussian splatting model on a COLMAP capture.](https://docs.gsplat.studio/main/examples/colmap.html)
-- [Fit a 2D image with 3D Gaussians.](https://docs.gsplat.studio/main/examples/image.html)
-- [Render a large scene in real-time.](https://docs.gsplat.studio/main/examples/large_scale.html)
-- [Train on an NCore v4 capture.](https://docs.gsplat.studio/main/examples/ncore.html)
-
-
-## Inference Rendering
-
-gsplat includes an experimental inference-only rendering path based on HiGS (Hierarchically Tiled Gaussian Splatting) in the standalone `experimental` package, designed for low-latency rendering of pre-trained Gaussian scenes where training gradients are not needed. The inference path packs scene data into compact fp16 layouts and uses a macro-tile fused rasterization pipeline for fast single-camera rendering.
+## API
 
 ```python
-from gsplat.experimental import render_scene, GaussianInferenceScene
+from gsplat import rasterization
+
+colors, alphas, meta = rasterization(
+    means, quats, scales, opacities, sh,  # [N,3] [N,4] [N,3] [N] [N,K,3]
+    viewmats, Ks, width, height,          # [C,4,4] [C,3,3]
+    sh_degree=3, render_mode="RGB+ED",
+    packed=True, stereo=True,             # stereo: shared SH for C == 2
+)
 ```
 
-The `simple_viewer.py` example supports the Inference path via the `--use_gaussian_render_inference_scene` flag. A standalone benchmark comparing Inference rendering against the default `rasterization()` path is available in [examples/benchmarks/gaussian_render_inference_scene/](examples/benchmarks/gaussian_render_inference_scene/); run [`gaussian_render_inference_scene_bench.py`](examples/benchmarks/gaussian_render_inference_scene/gaussian_render_inference_scene_bench.py) from the repo root. For more details, see the [HiGS project page](https://research.nvidia.com/labs/sil/projects/higs/).
+## Pipeline
 
-## Development and Contribution
+`gsplat/rendering.py` calls one C++ function, `rasterization_3dgs` in
+`gsplat/cuda/csrc/Rendering.cpp`, which runs:
 
-This repository was born from the curiosity of people on the Nerfstudio team trying to understand a new rendering technique. We welcome contributions of any kind and are open to feedback, bug-reports, and improvements to help expand the capabilities of this software.
+| Stage | Host | Kernel |
+|---|---|---|
+| 1. Project (EWA, pinhole) | `Projection.cpp` | `ProjectionEWA3DGSPacked.cu` (packed), `ProjectionEWA3DGSFused.cu` (dense) |
+| 2. SH -> RGB (+ depth channel) | `SphericalHarmonics.cpp` | `SphericalHarmonicsCUDA.cu` (per-entry SH; fused SH+depth for dense) |
+| 3. Tile intersect + radix sort | `Intersect.cpp` | `IntersectTile.cu` |
+| 4. Rasterize (alpha compositing) | `Rasterization.cpp` | `RasterizeToPixels3DGSSerialBatchFwd.cu` |
+| 5. Expected depth | `Rendering.cpp` | ATen |
 
-This project is developed by the contributors coming from following institutes (unordered):
+Shared device code: `include/Common.h` (types, constants), `include/Utils.cuh`
+(projection math), `include/Dispatch.h` (compile-time dispatch),
+`csrc/RasterizeToPixels3DGSDevice.cuh`, `csrc/SphericalHarmonics.cuh`.
 
-- UC Berkeley
-- NVIDIA
-- ShanghaiTech University
-- Amazon
-- Meta
-- IIIT
-- LumaAI
-- SpectacularAI
-- Aalto University
-- CMU
+`packed=True` keeps only surviving (camera, gaussian) pairs; `packed=False`
+keeps all of them, colours them in one fused kernel and can sort per image
+(`segmented=True`). Stages 1 (packed) and 3 each read a count back to the host.
 
-We also have a white paper with about the project with benchmarking and mathematical supplement with conventions and derivations, available [on arXiv](https://arxiv.org/abs/2409.06765). If you find this library useful in your projects or papers, please consider citing:
+## Build
 
-```
-@article{ye2025gsplat,
-  title={gsplat: An open-source library for Gaussian splatting},
-  author={Ye, Vickie and Li, Ruilong and Kerr, Justin and Turkulainen, Matias and Yi, Brent and Pan, Zhuoyang and Seiskari, Otto and Ye, Jianbo and Hu, Jeffrey and Tancik, Matthew and Angjoo Kanazawa},
-  journal={Journal of Machine Learning Research},
-  volume={26},
-  number={34},
-  pages={1--17},
-  year={2025}
-}
+The editable install JIT-compiles on first import into
+`$TORCH_EXTENSIONS_DIR/gsplat_cuda` (about 30 s):
+
+```bash
+pip install -e . --no-build-isolation   # or BUILD_NO_CUDA=1 to skip the AOT build
+VERBOSE=1 python -c "from gsplat.cuda._backend import _C"
 ```
 
-We welcome contributions of any kind and are open to feedback, bug-reports, and improvements to help expand the capabilities of this software. Please check [docs/DEV.md](docs/DEV.md) for more info about development.
+Build knobs (see `gsplat/cuda/build.py`): `NUM_CHANNELS="1,3,4"` (rasterizer
+channel counts, default in `csrc/Config.h`), `WITH_SYMBOLS=1` (`-lineinfo`
+for Nsight), `DEBUG=1`, `FAST_MATH=0`, `NVCC_FLAGS`.
+
+## License
+
+Apache-2.0, see `LICENSE`. Original work by the Nerfstudio team and NVIDIA;
+please cite gsplat (`CITATION.bib`).

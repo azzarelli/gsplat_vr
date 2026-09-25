@@ -17,57 +17,9 @@
 
 #pragma once
 
-// If user wants to explicitly build at least one, they have to specify all modules they want to build
-// If they don't specify any, or they don't want to build some, all the others that aren't specified
-// will be built.
-// Ex:
-//   GSPLAT_BUILD_3DGUT=1 GSPLAT_BUILD_2DGS=1 -> build 3dgut and 2dgs only, do not build anything else.
-//   GSPLAT_BUILD_3DGUT=0 GSPLAT_BUILD_2DGS=0 -> build everything except 3dgut and 2dgs
-//   <no GSPLAT_BUILD_* defined> -> build everything
-
-#if defined(GSPLAT_BUILD_2DGS) && GSPLAT_BUILD_2DGS      \
-    || defined(GSPLAT_BUILD_3DGS) && GSPLAT_BUILD_3DGS   \
-    || defined(GSPLAT_BUILD_3DGUT) && GSPLAT_BUILD_3DGUT \
-    || defined(GSPLAT_BUILD_ADAM) && GSPLAT_BUILD_ADAM   \
-    || defined(GSPLAT_BUILD_RELOC) && GSPLAT_BUILD_RELOC \
-    || defined(GSPLAT_BUILD_LOSSES) && GSPLAT_BUILD_LOSSES
-
-#    define GSPLAT_DEFAULT_ENABLE_BUILD 0
-#else
-#    define GSPLAT_DEFAULT_ENABLE_BUILD 1
-#endif
-
-#ifndef GSPLAT_BUILD_2DGS
-#    define GSPLAT_BUILD_2DGS GSPLAT_DEFAULT_ENABLE_BUILD
-#endif
-
-#ifndef GSPLAT_BUILD_3DGS
-#    define GSPLAT_BUILD_3DGS GSPLAT_DEFAULT_ENABLE_BUILD
-#endif
-
-#ifndef GSPLAT_BUILD_3DGUT
-#    define GSPLAT_BUILD_3DGUT GSPLAT_DEFAULT_ENABLE_BUILD
-#endif
-
-#ifndef GSPLAT_BUILD_ADAM
-#    define GSPLAT_BUILD_ADAM GSPLAT_DEFAULT_ENABLE_BUILD
-#endif
-
-#ifndef GSPLAT_BUILD_RELOC
-#    define GSPLAT_BUILD_RELOC GSPLAT_DEFAULT_ENABLE_BUILD
-#endif
-
-#ifndef GSPLAT_BUILD_LOSSES
-#    define GSPLAT_BUILD_LOSSES GSPLAT_DEFAULT_ENABLE_BUILD
-#endif
-
-// Camera wrappers are a Python-exposed testing facility, not a core module:
-// build.py omits CameraWrappers.cu from the source list when this flag is off,
-// so it defaults to 0 rather than GSPLAT_DEFAULT_ENABLE_BUILD.
-#ifndef GSPLAT_BUILD_CAMERA_WRAPPERS
-#    define GSPLAT_BUILD_CAMERA_WRAPPERS 0
-#endif
-
+// Feature channel counts the rasterizer is compiled for (one kernel per
+// entry): 1 = D/ED, 3 = RGB, 4 = RGB+D/ED. Override with NUM_CHANNELS="..."
+// at build time.
 #ifndef GSPLAT_NUM_CHANNELS
-#    define GSPLAT_NUM_CHANNELS 1, 2, 3, 4, 5, 6, 8, 9, 16, 17, 21, 23, 24, 32, 33, 64, 65, 128, 129, 256, 257, 512, 513
+#    define GSPLAT_NUM_CHANNELS 1, 3, 4
 #endif
