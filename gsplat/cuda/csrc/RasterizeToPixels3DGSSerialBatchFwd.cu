@@ -168,9 +168,9 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
     const int64_t num_batches = (range_end - range_start + BATCH_SIZE - 1) / BATCH_SIZE;
 
     extern __shared__ int s[];
-    int32_t *id_batch      = (int32_t *)s;                                            // [BATCH_SIZE]
-    vec3 *xy_opacity_batch = reinterpret_cast<vec3 *>(&id_batch[BATCH_SIZE]);         // [BATCH_SIZE]
+    vec3 *xy_opacity_batch = reinterpret_cast<vec3 *>(s);                            // [BATCH_SIZE]
     vec3 *conic_batch      = reinterpret_cast<vec3 *>(&xy_opacity_batch[BATCH_SIZE]); // [BATCH_SIZE]
+    float *color_batch     = reinterpret_cast<float *>(&conic_batch[BATCH_SIZE]);     // [BATCH_SIZE, CDIM]
 
     // transmittance left per pixel
     float T[PIXELS_PER_THREAD];
@@ -196,11 +196,15 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
         if(idx < range_end)
         {
             const int32_t g       = flatten_ids[idx]; // flatten index in [I * N] or [nnz]
-            id_batch[tid]         = g;
             const vec2 xy         = means2d[g];
             const float opac      = opacities[g];
             xy_opacity_batch[tid] = {xy.x, xy.y, opac};
             conic_batch[tid]      = conics[g];
+#    pragma unroll
+            for(uint32_t k = 0; k < CDIM; ++k)
+            {
+                color_batch[tid * CDIM + k] = colors[g * CDIM + k];
+            }
         }
 
         // wait for other threads to collect the gaussians in batch. A CTA
@@ -241,21 +245,18 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
                 const float alpha = gw.alpha;
 
                 const float next_T = T[p] * (1.0f - alpha);
-                if(next_T <= TRANSMITTANCE_THRESHOLD)
-                { // this pixel is done: exclusive
-                    done_mask |= (1u << p);
-                    continue;
-                }
-
-                const int32_t g    = id_batch[t];
                 const float vis    = alpha * T[p];
-                const float *c_ptr = colors + g * CDIM;
+                const float *c_ptr = color_batch + t * CDIM;
 #    pragma unroll
                 for(uint32_t k = 0; k < CDIM; ++k)
                 {
                     pix_out[p][k] += c_ptr[k] * vis;
                 }
                 T[p] = next_T;
+                if(next_T <= TRANSMITTANCE_THRESHOLD)
+                { // this pixel is done: inclusive
+                    done_mask |= (1u << p);
+                }
             }
         }
 
@@ -359,7 +360,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         auto launch_variant = [&]<uint32_t TILE_SIZE, uint32_t CTA_SIZE>()
         {
             const dim3 threads       = dim3{CTA_SIZE, 1, 1};
-            const int64_t shmem_size = CTA_SIZE * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3));
+            const int64_t shmem_size = CTA_SIZE * (sizeof(vec3) + sizeof(vec3) + CDIM * sizeof(float));
 
             if(cudaFuncSetAttribute(
                    rasterize_to_pixels_3dgs_fwd_kernel<CDIM, TILE_SIZE, CTA_SIZE>,

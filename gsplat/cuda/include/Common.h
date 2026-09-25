@@ -77,10 +77,10 @@ constexpr uint32_t kMaxCudaGridDimY = 65535;
 #define ALPHA_THRESHOLD         (1.f / 255.f)
 // GAUSSIAN_EXTEND determines where the gaussian is truncated in standard deviations."
 #define GAUSSIAN_EXTEND         3.33f
-// A maximal-opacity Gaussian has to be hit twice to reach the threshold:
-// TRANSMITTANCE_THRESHOLD = (1 - MAX_ALPHA)^2
+// A pixel stops after the Gaussian that takes its transmittance to this or
+// lower, so at most this much light is left out.
 #define MAX_ALPHA               0.99f
-#define TRANSMITTANCE_THRESHOLD 1e-4f
+#define TRANSMITTANCE_THRESHOLD 1e-3f
 
 // Floor for the antialiased compensation factor (sqrt(det_orig / det_blur)).
 // Prevents compensation from reaching zero for extremely small Gaussians.
