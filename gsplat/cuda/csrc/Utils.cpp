@@ -21,6 +21,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/irange.h>
 #include <cuda_runtime_api.h>
+#include <cuda_runtime.h>
 
 #include <vector>
 
