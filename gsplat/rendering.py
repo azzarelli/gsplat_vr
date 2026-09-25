@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Literal, Optional, Tuple
+from typing import Dict, Literal, Optional, Sequence, Tuple
 
 from torch import Tensor
 
@@ -22,7 +22,7 @@ RenderMode = Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"]
 _COLOR_MODES = ("RGB", "RGB+D", "RGB+ED")
 _RENDER_MODES = ("RGB", "D", "ED", "RGB+D", "RGB+ED")
 # Order of the CUDA-event stages in Rendering.cpp.
-_STAGES = ("project", "sh", "isect", "sort", "blend", "ed")
+_STAGES = ("project", "sh", "isect", "sort", "blend")
 
 
 def rasterization(
@@ -46,14 +46,15 @@ def rasterization(
     render_mode: RenderMode = "RGB",
     antialiased: bool = False,
     stereo: bool = False,
+    targets: Optional[Sequence[Tuple[int, int]]] = None,
     profile: bool = False,
-) -> Tuple[Tensor, Tensor, Dict]:
+) -> Tuple[Optional[Tensor], Optional[Tensor], Dict]:
     """Render C views of N Gaussians. Forward only.
 
     Returns (render_colors [C, H, W, X], render_alphas [C, H, W, 1], meta).
     X is D colour channels, +1 depth channel for "RGB+D"/"RGB+ED", or just
     the depth channel for "D"/"ED". "D" is alpha-weighted depth; "ED" divides
-    it by alpha.
+    it by alpha. With `targets` the images go there instead and both are None.
     meta: n_entries (projected (camera, gaussian) entries: survivors if packed,
     else C * N), n_isects (gaussian-tile overlaps) and stage_ms.
 
@@ -65,6 +66,9 @@ def rasterization(
         set to the training kernel size.
     stereo: packed with C == 2 only. Evaluates SH once per gaussian from the
         midpoint of the two cameras and shares it between the eyes.
+    targets: per camera, (colour, alpha) CUDA array handles to write into,
+        e.g. mapped GL textures registered with SURFACE_LDST. Colour is RGBA32F
+        (RGB + depth, so "RGB+D"/"RGB+ED" with 3 colour channels), alpha R32F.
     profile: time each stage with CUDA events into meta["stage_ms"] (syncs).
     radius_clip: cull gaussians whose projected radius is at most this (px).
     eps2d: added to the 2D covariance diagonal (low-pass filter).
@@ -100,6 +104,8 @@ def rasterization(
         packed,
         antialiased,
         stereo,
+        [c for c, _ in targets] if targets else [],
+        [a for _, a in targets] if targets else [],
         profile,
     )
 

@@ -20,17 +20,32 @@
 
 #include <ATen/core/Tensor.h>
 #include <cstdint>
+#include <cuda_runtime_api.h>
+#include <vector>
 
 namespace gsplat
 {
 struct RasterizeResult
 {
-    at::Tensor renders; // [I, H, W, channels]
-    at::Tensor alphas;  // [I, H, W, 1]
+    at::Tensor renders; // [I, H, W, channels], undefined when writing to targets
+    at::Tensor alphas;  // [I, H, W, 1], undefined when writing to targets
+};
+
+// Per-image surfaces the kernel writes into instead of tensors: colour as
+// float4 (RGB + depth) and alpha as float.
+struct SurfaceTargets
+{
+    static constexpr int kMax = 4;
+    cudaSurfaceObject_t color[kMax];
+    cudaSurfaceObject_t alpha[kMax];
+    bool enabled;
 };
 
 // Front-to-back alpha compositing, one CTA per tile. Dense inputs are
 // [I, N, ...]; packed inputs are [nnz, ...] and flatten_ids index rows.
+// expected_depth divides the last channel by alpha. color/alpha_targets are
+// CUDA array handles (RGBA32F, R32F; one each per image, e.g. mapped GL
+// textures) to write into instead of returning tensors.
 RasterizeResult rasterize_to_pixels_3dgs(
     const at::Tensor &means2d,                   // [..., N, 2] or [nnz, 2]
     const at::Tensor &conics,                    // [..., N, 3] or [nnz, 3]
@@ -41,7 +56,10 @@ RasterizeResult rasterize_to_pixels_3dgs(
     int64_t image_height,
     int64_t tile_size,
     const at::Tensor &isect_offsets, // [..., tile_height, tile_width]
-    const at::Tensor &flatten_ids    // [n_isects]
+    const at::Tensor &flatten_ids,   // [n_isects]
+    bool expected_depth,
+    const std::vector<int64_t> &color_targets,
+    const std::vector<int64_t> &alpha_targets
 );
 
 void launch_rasterize_to_pixels_3dgs_fwd_kernel(
@@ -56,8 +74,10 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     const uint32_t tile_size,
     const at::Tensor isect_offsets,
     const at::Tensor flatten_ids,
-    // outputs
+    const bool expected_depth,
+    // outputs: tensors, or surfaces when targets.enabled
     at::Tensor renders,
-    at::Tensor alphas
+    at::Tensor alphas,
+    const SurfaceTargets &targets
 );
 } // namespace gsplat

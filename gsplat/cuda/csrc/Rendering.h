@@ -21,13 +21,14 @@
 #include <ATen/core/Tensor.h>
 #include <cstdint>
 #include <tuple>
+#include <vector>
 
 namespace gsplat
 {
-// (render_colors, render_alphas,
+// (render_colors, render_alphas, -- undefined when writing to targets
 //  n_entries,  -- projected (camera, gaussian) entries: survivors if packed, else C * N
 //  n_isects,   -- (gaussian, tile) overlaps
-//  stage_ms)   -- [6] CPU float32 if profile, else empty
+//  stage_ms)   -- [5] CPU float32 if profile, else empty
 using RasterizationOutputs = std::tuple<at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor>;
 
 // Full forward pass for C cameras: project -> colour -> tile intersect/sort ->
@@ -54,6 +55,8 @@ RasterizationOutputs rasterization_3dgs(
     bool packed,
     bool antialiased, // opacity *= compensation of the eps2d blur (Mip-Splatting 2D filter)
     bool stereo,
+    const std::vector<int64_t> &color_targets, // CUDA array handles per camera: RGBA32F (RGB + depth)
+    const std::vector<int64_t> &alpha_targets, // and R32F; empty -> return tensors
     bool profile
 );
 } // namespace gsplat

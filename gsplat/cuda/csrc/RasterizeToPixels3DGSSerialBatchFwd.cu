@@ -55,8 +55,10 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
     const uint32_t block_offset,
     const int64_t *__restrict__ isect_offsets, // [I, tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,   // [n_isects]
-    float *__restrict__ render_colors,         // [I, image_height, image_width, CDIM]
-    float *__restrict__ render_alphas          // [I, image_height, image_width, 1]
+    const bool expected_depth,
+    float *__restrict__ render_colors, // [I, image_height, image_width, CDIM], null with targets
+    float *__restrict__ render_alphas, // [I, image_height, image_width, 1], null with targets
+    const SurfaceTargets targets
 )
 {
     constexpr uint32_t BATCH_SIZE = CTA_SIZE;
@@ -87,8 +89,11 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
     const uint32_t thread_y = tid >> TILE_SHIFT; // X >> 4 == X / 16
 
     isect_offsets += image_id * grid_height * grid_width;
-    render_colors += image_id * image_height * image_width * CDIM;
-    render_alphas += image_id * image_height * image_width;
+    if(!targets.enabled)
+    {
+        render_colors += image_id * image_height * image_width * CDIM;
+        render_alphas += image_id * image_height * image_width;
+    }
     if(backgrounds != nullptr)
     {
         backgrounds += image_id * CDIM;
@@ -267,16 +272,38 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
 #    pragma unroll
         for(uint32_t p = 0; p < PIXELS_PER_THREAD; ++p)
         {
-            if(out_y[p] < image_height)
+            if(out_y[p] >= image_height)
             {
-                // T is the transmittance after the last gaussian in this pixel.
-                render_alphas[pix_id[p]] = 1.0f - T[p];
+                continue;
+            }
+            // T is the transmittance after the last gaussian in this pixel.
+            const float alpha = 1.0f - T[p];
+            float out[CDIM];
 #    pragma unroll
-                for(uint32_t k = 0; k < CDIM; ++k)
+            for(uint32_t k = 0; k < CDIM; ++k)
+            {
+                out[k] = backgrounds == nullptr ? pix_out[p][k] : (pix_out[p][k] + T[p] * backgrounds[k]);
+            }
+            if(expected_depth)
+            {
+                // IEEE division: -use_fast_math would otherwise approximate it
+                out[CDIM - 1] = __fdiv_rn(out[CDIM - 1], fmaxf(alpha, 1e-10f));
+            }
+            if constexpr(CDIM == 4)
+            {
+                if(targets.enabled)
                 {
-                    render_colors[pix_id[p] * CDIM + k]
-                        = backgrounds == nullptr ? pix_out[p][k] : (pix_out[p][k] + T[p] * backgrounds[k]);
+                    const float4 rgbd = make_float4(out[0], out[1], out[2], out[3]);
+                    surf2Dwrite(rgbd, targets.color[image_id], out_x * sizeof(float4), out_y[p]);
+                    surf2Dwrite(alpha, targets.alpha[image_id], out_x * sizeof(float), out_y[p]);
+                    continue;
                 }
+            }
+            render_alphas[pix_id[p]] = alpha;
+#    pragma unroll
+            for(uint32_t k = 0; k < CDIM; ++k)
+            {
+                render_colors[pix_id[p] * CDIM + k] = out[k];
             }
         }
     }
@@ -297,17 +324,19 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     // intersections
     const at::Tensor isect_offsets, // [..., grid_h, grid_w]
     const at::Tensor flatten_ids,   // [n_isects]
-    // outputs
+    const bool expected_depth,
+    // outputs: tensors, or surfaces when targets.enabled
     at::Tensor renders, // [..., image_height, image_width, channels]
-    at::Tensor alphas  // [..., image_height, image_width]
+    at::Tensor alphas,  // [..., image_height, image_width]
+    const SurfaceTargets &targets
 )
 {
     const bool packed = means2d.dim() == 2;
 
     const uint32_t N       = packed ? 0 : means2d.size(-2);                 // number of gaussians
-    const uint32_t I       = alphas.numel() / (image_height * image_width); // number of images
     const uint32_t grid_h  = isect_offsets.size(-2);
     const uint32_t grid_w  = isect_offsets.size(-1);
+    const uint32_t I       = isect_offsets.numel() / (grid_h * grid_w); // number of images
     const int64_t n_isects = flatten_ids.size(0);
     const uint32_t n_tiles = I * grid_h * grid_w;
     const dim3 grid        = {n_tiles, 1, 1};
@@ -320,6 +349,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         ". To add support, rebuild gsplat with this channel count included "
         "in -DGSPLAT_NUM_CHANNELS=... (see gsplat/cuda/csrc/Config.h)."
     );
+    TORCH_CHECK(!targets.enabled || channels == 4, "surface targets take RGB + depth (4 channels), got ", channels);
+    TORCH_CHECK(!(targets.enabled && masks.has_value()), "tile masks are not supported with surface targets");
 
     auto launch_kernel = [&]<typename ChannelsT>()
     {
@@ -366,8 +397,10 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
                     0,
                     isect_offsets.const_data_ptr<int64_t>(),
                     flatten_ids.const_data_ptr<int32_t>(),
-                    renders.data_ptr<float>(),
-                    alphas.data_ptr<float>()
+                    expected_depth,
+                    targets.enabled ? nullptr : renders.data_ptr<float>(),
+                    targets.enabled ? nullptr : alphas.data_ptr<float>(),
+                    targets
                 );
         };
 

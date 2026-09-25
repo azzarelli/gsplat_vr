@@ -23,12 +23,13 @@
 //                   depth appended as the last feature channel
 //   3. intersect    one (image|tile|depth) key per gaussian-tile overlap,
 //                   radix sorted, then per-tile start offsets
-//   4. rasterize    front-to-back alpha compositing per tile
-//   5. ED           divide accumulated depth by alpha
+//   4. rasterize    front-to-back alpha compositing per tile; ED divides the
+//                   depth by alpha as each pixel is written. Writes tensors,
+//                   or straight into CUDA arrays (e.g. mapped GL textures)
 //
 // Stages 1 and 3 each read a count back to the host (nnz, n_isects).
 // With `profile`, CUDA events split this into project | sh | isect | sort |
-// blend | ed (the order _STAGES in gsplat/rendering.py expects).
+// blend (the order _STAGES in gsplat/rendering.py expects).
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -234,6 +235,8 @@ RasterizationOutputs rasterization_3dgs(
     bool packed,
     bool antialiased,
     bool stereo,
+    const std::vector<int64_t> &color_targets,
+    const std::vector<int64_t> &alpha_targets,
     bool profile
 )
 {
@@ -378,20 +381,13 @@ RasterizationOutputs rasterization_3dgs(
         image_height,
         tile_size,
         isect_offsets,
-        isects.flatten_ids
+        isects.flatten_ids,
+        expected_depth,
+        color_targets,
+        alpha_targets
     );
-    at::Tensor render_colors = raster.renders;
     timer.mark();
 
-    // --- 5. Expected depth ---------------------------------------------------
-    if(expected_depth)
-    {
-        const int64_t d  = render_colors.size(-1) - 1;
-        at::Tensor depth = render_colors.slice(-1, d, d + 1) / raster.alphas.clamp_min(1e-10);
-        render_colors    = at::cat({render_colors.slice(-1, 0, d), depth}, -1);
-    }
-    timer.mark();
-
-    return {render_colors, raster.alphas, depths.numel(), isects.flatten_ids.size(0), timer.elapsed_ms()};
+    return {raster.renders, raster.alphas, depths.numel(), isects.flatten_ids.size(0), timer.elapsed_ms()};
 }
 } // namespace gsplat
