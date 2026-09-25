@@ -406,19 +406,19 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
                 );
         };
 
-        // One thread per pixel (CTA=256, PIXELS_PER_THREAD=1) at tile_size=16.
-        // CTA=64 (PPT=4) keeps a pix_out[PPT][CDIM] accumulator per thread, whose
-        // register footprint scales with 4*CDIM and spills to local memory at high
-        // channel counts (~10x slower forward at CDIM=128). PPT=1 makes register
-        // pressure scale with CDIM alone; it is parity at CDIM=3 (see issue #8).
+        // tile_size=16 shades 4 pixels per thread (CTA=64) by default: a thread
+        // reads each batched gaussian once for 4 pixels of one column, which
+        // roughly halved blend time at CDIM=4. GSPLAT_PIXELS_PER_THREAD=1|2|4
+        // overrides it (read once per process). pix_out[PPT][CDIM] lives in
+        // registers, so high PPT spills at large CDIM (~10x slower at CDIM=128).
         if(tile_size == 16)
         {
-            // TEMPORARY, for profiling: GSPLAT_PIXELS_PER_THREAD=2|4 picks CTA=128|64.
             static const int ppt = []
             {
                 const char *v = std::getenv("GSPLAT_PIXELS_PER_THREAD");
-                return v ? std::atoi(v) : 1;
+                return v ? std::atoi(v) : 4;
             }();
+            TORCH_CHECK(ppt == 1 || ppt == 2 || ppt == 4, "GSPLAT_PIXELS_PER_THREAD must be 1, 2 or 4, got ", ppt);
             if(ppt == 4)
             {
                 launch_variant.template operator()<16, 64>();
