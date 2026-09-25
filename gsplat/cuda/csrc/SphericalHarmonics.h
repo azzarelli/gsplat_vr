@@ -25,9 +25,9 @@ namespace gsplat
 {
 inline constexpr int SH_MAX_DEGREE = 4;
 
-// SH -> raw colour (no +0.5 bias). Packed: coeffs are [nnz, K, D] (already
-// gathered per entry) and the ids say which camera/gaussian each row is;
-// returns [nnz, D]. Dense: coeffs are [N, K, D]; returns [..., C, N, D].
+// SH -> raw colour (no +0.5 bias). coeffs are [N, K, D]. Packed: the ids say
+// which camera/gaussian each output row is, and coeffs are read by gaussian
+// id; returns [len(ids), D]. Dense: returns [..., C, N, D].
 at::Tensor spherical_harmonics(
     int64_t degree,
     const at::Tensor &means,    // [..., N, 3]
@@ -37,6 +37,14 @@ at::Tensor spherical_harmonics(
     const at::optional<at::Tensor> &batch_ids,
     const at::optional<at::Tensor> &camera_ids,
     const at::optional<at::Tensor> &gaussian_ids
+);
+
+// Packed blend features from raw SH colours: [max(colors[row] + 0.5, 0) | depth]
+// per entry, with row = rows[e] (e.g. a shared per-gaussian colour) or e.
+at::Tensor packed_features(
+    const at::Tensor &colors,              // [R, D] float
+    const at::optional<at::Tensor> &rows,  // [n] int64; absent: R == n
+    const at::optional<at::Tensor> &depths // [n]; appended as the last channel when given
 );
 
 // Dense path only: one kernel writes [max(SH + 0.5, 0) | depth] per (camera, gaussian),
@@ -63,6 +71,13 @@ void launch_spherical_harmonics_fwd_kernel(
     const at::optional<at::Tensor> camera_ids,
     const at::optional<at::Tensor> gaussian_ids,
     at::Tensor colors
+);
+
+void launch_pack_features_kernel(
+    const at::Tensor colors,
+    const at::optional<at::Tensor> rows,
+    const at::optional<at::Tensor> depths,
+    at::Tensor out
 );
 
 void launch_assemble_proj_features_unpacked_fwd_kernel(

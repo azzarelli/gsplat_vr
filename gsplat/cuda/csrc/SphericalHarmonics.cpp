@@ -61,7 +61,7 @@ at::Tensor spherical_harmonics(
     std::vector<int64_t> shape;
     if(batch_ids.has_value())
     {
-        shape = {coeffs.size(0), coeffs.size(-1)};
+        shape = {batch_ids.value().size(0), coeffs.size(-1)};
     }
     else
     {
@@ -76,6 +76,30 @@ at::Tensor spherical_harmonics(
         degree, means, viewmats, coeffs, masks, batch_ids, camera_ids, gaussian_ids, colors
     );
     return colors;
+}
+
+at::Tensor packed_features(
+    const at::Tensor &colors,
+    const at::optional<at::Tensor> &rows,
+    const at::optional<at::Tensor> &depths
+)
+{
+    DEVICE_GUARD(colors);
+    CHECK_INPUT(colors);
+    TORCH_CHECK(colors.dim() == 2 && colors.scalar_type() == at::kFloat, "colors must be float [R, D]");
+    const int64_t n = rows.has_value() ? rows.value().size(0) : colors.size(0);
+    if(depths.has_value())
+    {
+        TORCH_CHECK(depths.value().numel() == n, "depths must have one value per entry");
+    }
+    at::Tensor out = at::empty({n, colors.size(-1) + (depths.has_value() ? 1 : 0)}, colors.options());
+    launch_pack_features_kernel(
+        colors,
+        rows.has_value() ? at::optional<at::Tensor>(rows.value().contiguous()) : c10::nullopt,
+        depths.has_value() ? at::optional<at::Tensor>(depths.value().contiguous()) : c10::nullopt,
+        out
+    );
+    return out;
 }
 
 at::Tensor assemble_proj_features(

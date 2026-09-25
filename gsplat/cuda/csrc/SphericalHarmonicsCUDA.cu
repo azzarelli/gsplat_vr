@@ -182,7 +182,6 @@ __global__ void spherical_harmonics_fwd_kernel(
     const int64_t batch_id  = packed ? batch_ids[output_id] : image_id / C;
     const int64_t camera_id = packed ? camera_ids[output_id] : image_id % C;
     const int64_t gaussian_id = packed ? gaussian_ids[output_id] : local_elem_id % gaussian_count + gaussian_offset;
-    const int64_t coeff_id    = packed ? output_id : gaussian_id;
     const uint32_t c          = idx % D; // output channel
     if(masks != nullptr && !masks[output_id])
     {
@@ -191,7 +190,7 @@ __global__ void spherical_harmonics_fwd_kernel(
     const int64_t image_offset = batch_id * C + camera_id;
     const float *mean          = means + (batch_id * N + gaussian_id) * 3;
     const vec3 dir             = view_direction_from_camera_data(mean, viewmats, camera_offsets, image_offset);
-    sh_coeffs_to_color_fast<scalar_t>(degrees_to_use, D, c, dir, coeffs + coeff_id * K * D, colors + output_id * D);
+    sh_coeffs_to_color_fast<scalar_t>(degrees_to_use, D, c, dir, coeffs + gaussian_id * K * D, colors + output_id * D);
 }
 
 // K=16, D=3 forward kernel for the RGB SH hot path. One thread per
@@ -230,8 +229,7 @@ __global__ void __launch_bounds__(256, 4) spherical_harmonics_fwd_kernel_k16_3ch
     const uint32_t batch_id     = packed ? batch_ids[idx] : image_id / C;
     const uint32_t camera_id    = packed ? camera_ids[idx] : image_id % C;
     const uint32_t gaussian_id  = packed ? gaussian_ids[idx] : idx % N;
-    const uint32_t coeff_id     = packed ? idx : gaussian_id;
-    coeffs                     += coeff_id * 16 * 3;
+    coeffs                     += static_cast<int64_t>(gaussian_id) * 16 * 3;
 
     constexpr bool COEFFS_FP32 = std::is_same_v<scalar_t, float>;
 
@@ -294,7 +292,7 @@ void launch_spherical_harmonics_fwd_kernel(
     const uint32_t N = means.size(-2);
     const uint32_t C = viewmats.size(-3);
     const uint32_t B = c10::multiply_integers(means.sizes().slice(0, means.dim() - 2));
-    const uint32_t E = batch_ids.has_value() ? coeffs.size(0) : B * C * N;
+    const uint32_t E = batch_ids.has_value() ? batch_ids.value().size(0) : B * C * N;
 
     if(E == 0)
     {
@@ -406,6 +404,58 @@ void launch_spherical_harmonics_fwd_kernel(
             at::kHalf
         );
     }
+}
+
+// out[e] = [max(colors[row(e)] + 0.5, 0) | depths[e]]; row(e) = rows[e], or e.
+__global__ void pack_features_kernel(
+    const int64_t n,
+    const uint32_t D,
+    const float *__restrict__ colors, // [R, D]
+    const int64_t *__restrict__ rows, // [n] optional
+    const float *__restrict__ depths, // [n] optional
+    float *__restrict__ out           // [n, D (+1)]
+)
+{
+    const int64_t e = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if(e >= n)
+    {
+        return;
+    }
+    const int64_t r       = rows != nullptr ? rows[e] : e;
+    const uint32_t stride = D + (depths != nullptr ? 1 : 0);
+    for(uint32_t c = 0; c < D; ++c)
+    {
+        out[e * stride + c] = fmaxf(colors[r * D + c] + 0.5f, 0.f);
+    }
+    if(depths != nullptr)
+    {
+        out[e * stride + D] = depths[e];
+    }
+}
+
+void launch_pack_features_kernel(
+    const at::Tensor colors,
+    const at::optional<at::Tensor> rows,
+    const at::optional<at::Tensor> depths,
+    at::Tensor out
+)
+{
+    const int64_t n = out.size(0);
+    if(n == 0)
+    {
+        return;
+    }
+    constexpr unsigned int threads = 256;
+    const unsigned int blocks      = static_cast<unsigned int>(::cuda::ceil_div<int64_t>(n, threads));
+    pack_features_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        n,
+        static_cast<uint32_t>(colors.size(-1)),
+        colors.const_data_ptr<float>(),
+        rows.has_value() ? rows.value().const_data_ptr<int64_t>() : nullptr,
+        depths.has_value() ? depths.value().const_data_ptr<float>() : nullptr,
+        out.data_ptr<float>()
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // ===========================================================================

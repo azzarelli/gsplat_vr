@@ -112,7 +112,7 @@ namespace
         }
     }
 
-    // SH per packed entry: gather each entry's coeffs, evaluate, +0.5, clamp.
+    // SH per packed entry, coeffs read in place: [max(SH + 0.5, 0) | depth].
     at::Tensor evaluate_sh_packed(
         int64_t degree,
         const at::Tensor &coeffs,
@@ -121,13 +121,13 @@ namespace
         const at::Tensor &valid,
         const at::Tensor &batch_ids,
         const at::Tensor &camera_ids,
-        const at::Tensor &gaussian_ids
+        const at::Tensor &gaussian_ids,
+        const at::optional<at::Tensor> &depths
     )
     {
-        at::Tensor values = spherical_harmonics(
-            degree, means, viewmats, coeffs.index({gaussian_ids}), valid, batch_ids, camera_ids, gaussian_ids
-        );
-        return at::clamp_min(values + 0.5, 0.0);
+        at::Tensor values
+            = spherical_harmonics(degree, means, viewmats, coeffs, valid, batch_ids, camera_ids, gaussian_ids);
+        return packed_features(values, c10::nullopt, depths);
     }
 
     // Stereo: evaluate SH once per unique Gaussian from a single viewpoint
@@ -138,13 +138,14 @@ namespace
     // Both eyes get identical view-dependent colour. That removes the
     // inter-ocular specular difference, which is a real (if usually small)
     // stereo depth cue, so this is a quality trade and not a free win.
+    // Returns [max(SH + 0.5, 0) | depth] per packed entry.
     at::Tensor evaluate_feature_sh_stereo_shared(
         int64_t degree,
         const at::Tensor &coeffs,
         const at::Tensor &means,
         const at::Tensor &viewmats,     // [C, 4, 4], C == 2
         const at::Tensor &gaussian_ids, // [nnz]
-        bool clamp_after_bias
+        const at::optional<at::Tensor> &depths
     )
     {
         // SH only reads the camera centre (c = -R^T t), so take eye 0's matrix
@@ -179,19 +180,13 @@ namespace
             degree,
             means,
             cyc,
-            coeffs.index({uniq}),
+            coeffs,
             c10::nullopt,
             zeros_u, // batch_ids  (B == 1 on this path)
             zeros_u, // camera_ids (the single cyclopean camera)
             uniq
         );
-        // In-place so the bias and clamp do not each allocate a fresh [U, D].
-        values.add_(0.5);
-        if(clamp_after_bias)
-        {
-            values.clamp_min_(0.0);
-        }
-        return values.index({inverse});
+        return packed_features(values, inverse, depths);
     }
 
     // Already-activated colours ([N, D] or [C, N, D]) in the layout the
@@ -316,13 +311,15 @@ RasterizationOutputs rasterization_3dgs(
             );
             depth_in_features = append_depth;
         }
-        else if(stereo && C == 2)
-        {
-            features = evaluate_feature_sh_stereo_shared(sh_degree, colors.value(), means, viewmats, gaussian_ids, true);
-        }
         else
         {
-            features = evaluate_sh_packed(sh_degree, colors.value(), means, viewmats, valid, batch_ids, camera_ids, gaussian_ids);
+            const at::optional<at::Tensor> depth_channel = append_depth ? at::optional<at::Tensor>(depths) : c10::nullopt;
+            features = stereo && C == 2
+                         ? evaluate_feature_sh_stereo_shared(sh_degree, colors.value(), means, viewmats, gaussian_ids, depth_channel)
+                         : evaluate_sh_packed(
+                               sh_degree, colors.value(), means, viewmats, valid, batch_ids, camera_ids, gaussian_ids, depth_channel
+                           );
+            depth_in_features = append_depth;
         }
     }
     else if(colors.has_value())
