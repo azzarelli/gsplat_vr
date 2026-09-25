@@ -31,15 +31,14 @@ class StageTimer;
 // its gaussian row (dense: image * N + gaussian, packed: the packed row).
 struct TileIntersectResult
 {
-    at::Tensor tiles_per_gauss; // [..., N] or [nnz] int32
-    at::Tensor isect_ids;       // [n_isects] int64
-    at::Tensor flatten_ids;     // [n_isects] int32
+    at::Tensor isect_ids;   // [n_isects] int64
+    at::Tensor flatten_ids; // [n_isects] int32
 };
 
 // Packed inputs are [nnz, ...] with image_ids / gaussian_ids and need
 // n_images; dense inputs are [I, N, ...]. conics + opacities enable the tight
-// (AccuTile) tile test, otherwise the radius AABB is used. `segmented` sorts
-// each image separately (dense only). Costs a host sync to learn n_isects.
+// (AccuTile) tile test, otherwise the radius AABB is used. Costs a host sync
+// to learn n_isects.
 // `timer`, if given, is marked between emitting the pairs and sorting them.
 TileIntersectResult intersect_tile(
     const at::Tensor &means2d,
@@ -53,7 +52,6 @@ TileIntersectResult intersect_tile(
     int64_t tile_size,
     int64_t tile_width,
     int64_t tile_height,
-    bool segmented,
     StageTimer *timer = nullptr
 );
 
@@ -94,18 +92,6 @@ void radix_sort_double_buffer(
     const int64_t n_isects,
     const uint32_t image_n_bits,
     const uint32_t tile_n_bits,
-    at::Tensor isect_ids,
-    at::Tensor flatten_ids,
-    at::Tensor isect_ids_sorted,
-    at::Tensor flatten_ids_sorted
-);
-
-void segmented_radix_sort_double_buffer(
-    const int64_t n_isects,
-    const uint32_t n_segments,
-    const uint32_t image_n_bits,
-    const uint32_t tile_n_bits,
-    const at::Tensor offsets,
     at::Tensor isect_ids,
     at::Tensor flatten_ids,
     at::Tensor isect_ids_sorted,

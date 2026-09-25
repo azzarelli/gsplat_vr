@@ -62,9 +62,8 @@ RasterizeResult rasterize_to_pixels_3dgs(
         s.append(tail);
         return s;
     };
-    at::Tensor renders  = at::empty(with({image_height, image_width, colors.size(-1)}), opt);
-    at::Tensor alphas   = at::empty(with({image_height, image_width, 1}), opt);
-    at::Tensor last_ids = at::empty(with({image_height, image_width}), opt.dtype(at::kInt));
+    at::Tensor renders = at::empty(with({image_height, image_width, colors.size(-1)}), opt);
+    at::Tensor alphas  = at::empty(with({image_height, image_width, 1}), opt);
 
     launch_rasterize_to_pixels_3dgs_fwd_kernel(
         means2d,
@@ -79,8 +78,7 @@ RasterizeResult rasterize_to_pixels_3dgs(
         isect_offsets,
         flatten_ids,
         renders,
-        alphas,
-        last_ids
+        alphas
     );
     return {.renders = renders, .alphas = alphas};
 }

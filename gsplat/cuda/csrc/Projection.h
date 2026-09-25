@@ -29,10 +29,11 @@ namespace gsplat
 // Culled entries get radii == 0.
 struct ProjectionDenseResult
 {
-    at::Tensor radii;   // [..., C, N, 2] int32
-    at::Tensor means2d; // [..., C, N, 2]
-    at::Tensor depths;  // [..., C, N]
-    at::Tensor conics;  // [..., C, N, 3]
+    at::Tensor radii;         // [..., C, N, 2] int32
+    at::Tensor means2d;       // [..., C, N, 2]
+    at::Tensor depths;        // [..., C, N]
+    at::Tensor conics;        // [..., C, N, 3]
+    at::Tensor compensations; // [..., C, N], antialiased only
 };
 
 ProjectionDenseResult projection_ewa_3dgs_fused(
@@ -47,21 +48,23 @@ ProjectionDenseResult projection_ewa_3dgs_fused(
     double eps2d,
     double near_plane,
     double far_plane,
-    double radius_clip
+    double radius_clip,
+    bool antialiased
 );
 
 // Same projection, but only the surviving (camera, gaussian) pairs are kept,
 // sorted by image then gaussian id. Costs a host sync to learn nnz.
 struct ProjectionPackedResult
 {
-    at::Tensor batch_ids;    // [nnz] int64
-    at::Tensor camera_ids;   // [nnz] int64
-    at::Tensor gaussian_ids; // [nnz] int64
-    at::Tensor indptr;       // [B * C + 1] int32, row offsets per image
-    at::Tensor radii;        // [nnz, 2] int32
-    at::Tensor means2d;      // [nnz, 2]
-    at::Tensor depths;       // [nnz]
-    at::Tensor conics;       // [nnz, 3]
+    at::Tensor batch_ids;     // [nnz] int64
+    at::Tensor camera_ids;    // [nnz] int64
+    at::Tensor gaussian_ids;  // [nnz] int64
+    at::Tensor indptr;        // [B * C + 1] int32, row offsets per image
+    at::Tensor radii;         // [nnz, 2] int32
+    at::Tensor means2d;       // [nnz, 2]
+    at::Tensor depths;        // [nnz]
+    at::Tensor conics;        // [nnz, 3]
+    at::Tensor compensations; // [nnz], antialiased only
 };
 
 ProjectionPackedResult projection_ewa_3dgs_packed(
@@ -76,7 +79,8 @@ ProjectionPackedResult projection_ewa_3dgs_packed(
     double eps2d,
     double near_plane,
     double far_plane,
-    double radius_clip
+    double radius_clip,
+    bool antialiased
 );
 
 void launch_projection_ewa_3dgs_fused_fwd_kernel(
@@ -122,6 +126,7 @@ void launch_projection_ewa_3dgs_packed_fwd_kernel(
     const float radius_clip,
     const at::optional<at::Tensor> block_accum, // [B * C * blocks_per_row]
     const CameraModelType camera_model,
+    const bool antialiased, // cull on opacity * compensation (both passes)
     // outputs
     at::optional<at::Tensor> block_cnts,   // [B * C * blocks_per_row]
     at::optional<at::Tensor> indptr,       // [B * C + 1]

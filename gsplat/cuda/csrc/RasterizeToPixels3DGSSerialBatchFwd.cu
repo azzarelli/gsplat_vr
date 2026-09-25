@@ -56,8 +56,7 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
     const int64_t *__restrict__ isect_offsets, // [I, tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,   // [n_isects]
     float *__restrict__ render_colors,         // [I, image_height, image_width, CDIM]
-    float *__restrict__ render_alphas,         // [I, image_height, image_width, 1]
-    int32_t *__restrict__ last_ids             // [I, image_height, image_width]
+    float *__restrict__ render_alphas          // [I, image_height, image_width, 1]
 )
 {
     constexpr uint32_t BATCH_SIZE = CTA_SIZE;
@@ -90,7 +89,6 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
     isect_offsets += image_id * grid_height * grid_width;
     render_colors += image_id * image_height * image_width * CDIM;
     render_alphas += image_id * image_height * image_width;
-    last_ids      += image_id * image_height * image_width;
     if(backgrounds != nullptr)
     {
         backgrounds += image_id * CDIM;
@@ -151,7 +149,6 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
                 render_colors[pix_id[p] * CDIM + k] = backgrounds == nullptr ? 0.0f : backgrounds[k];
             }
             render_alphas[pix_id[p]] = 0.0f;
-            last_ids[pix_id[p]]      = 0;
         }
         return;
     }
@@ -170,18 +167,13 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
     vec3 *xy_opacity_batch = reinterpret_cast<vec3 *>(&id_batch[BATCH_SIZE]);         // [BATCH_SIZE]
     vec3 *conic_batch      = reinterpret_cast<vec3 *>(&xy_opacity_batch[BATCH_SIZE]); // [BATCH_SIZE]
 
-    // current visibility left to render
-    // transmittance is gonna be used in the backward pass which requires a high
-    // numerical precision so we use double for it. However double make bwd 1.5x
-    // slower so we stick with float for now.
+    // transmittance left per pixel
     float T[PIXELS_PER_THREAD];
 #    pragma unroll
     for(uint32_t p = 0; p < PIXELS_PER_THREAD; ++p)
     {
         T[p] = 1.0f;
     }
-    // Tile-relative offset of the most recent intersection to contribute.
-    int32_t last_intersection_offset[PIXELS_PER_THREAD] = {0};
     // result of the rendering for each pixel
     float pix_out[PIXELS_PER_THREAD][CDIM]              = {0.f};
 
@@ -258,8 +250,7 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
                 {
                     pix_out[p][k] += c_ptr[k] * vis;
                 }
-                last_intersection_offset[p] = static_cast<int32_t>(batch_offset + t);
-                T[p]                        = next_T;
+                T[p] = next_T;
             }
         }
 
@@ -278,11 +269,7 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
         {
             if(out_y[p] < image_height)
             {
-                // Here T is the transmittance AFTER the last gaussian in this pixel.
-                // We (should) store double precision as T would be used in backward
-                // pass and it can be very small and causing large diff in gradients
-                // with float32. However, double precision makes the backward pass 1.5x
-                // slower so we stick with float for now.
+                // T is the transmittance after the last gaussian in this pixel.
                 render_alphas[pix_id[p]] = 1.0f - T[p];
 #    pragma unroll
                 for(uint32_t k = 0; k < CDIM; ++k)
@@ -290,7 +277,6 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
                     render_colors[pix_id[p] * CDIM + k]
                         = backgrounds == nullptr ? pix_out[p][k] : (pix_out[p][k] + T[p] * backgrounds[k]);
                 }
-                last_ids[pix_id[p]] = last_intersection_offset[p];
             }
         }
     }
@@ -313,8 +299,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     const at::Tensor flatten_ids,   // [n_isects]
     // outputs
     at::Tensor renders, // [..., image_height, image_width, channels]
-    at::Tensor alphas,  // [..., image_height, image_width]
-    at::Tensor last_ids // [..., image_height, image_width]
+    at::Tensor alphas  // [..., image_height, image_width]
 )
 {
     const bool packed = means2d.dim() == 2;
@@ -382,17 +367,10 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
                     isect_offsets.const_data_ptr<int64_t>(),
                     flatten_ids.const_data_ptr<int32_t>(),
                     renders.data_ptr<float>(),
-                    alphas.data_ptr<float>(),
-                    last_ids.data_ptr<int32_t>()
+                    alphas.data_ptr<float>()
                 );
         };
 
-        // NOTE: Here we need to support tile_size=4 temporarily, because test_basic.py
-        // dynamically sets the tile_size=4 when CDIM >=32 to avoid exceeding the
-        // maximal shared memory size via the backward kernel's shared memory config.
-        // When we also convert the 3DGS backward rasterizer pass, it will require much
-        // less shared memory since we're iterating with PPT=4 and will therefore be able
-        // to remove tile_size=4 both here and in test_basic.py.
         // One thread per pixel (CTA=256, PIXELS_PER_THREAD=1) at tile_size=16.
         // CTA=64 (PPT=4) keeps a pix_out[PPT][CDIM] accumulator per thread, whose
         // register footprint scales with 4*CDIM and spills to local memory at high

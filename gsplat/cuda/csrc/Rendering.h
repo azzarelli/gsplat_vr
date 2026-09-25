@@ -25,25 +25,10 @@
 namespace gsplat
 {
 // (render_colors, render_alphas,
-//  camera_ids, gaussian_ids,                   -- packed only, else undefined
-//  radii, means2d, depths, conics, opacities,  -- projected gaussians
-//  tiles_per_gauss, isect_ids, flatten_ids, isect_offsets,
-//  stage_ms)                                   -- [6] CPU float32 if profile, else empty
-using RasterizationOutputs = std::tuple<
-    at::Tensor,
-    at::Tensor,
-    at::Tensor,
-    at::Tensor,
-    at::Tensor,
-    at::Tensor,
-    at::Tensor,
-    at::Tensor,
-    at::Tensor,
-    at::Tensor,
-    at::Tensor,
-    at::Tensor,
-    at::Tensor,
-    at::Tensor>;
+//  n_entries,  -- projected (camera, gaussian) entries: survivors if packed, else C * N
+//  n_isects,   -- (gaussian, tile) overlaps
+//  stage_ms)   -- [6] CPU float32 if profile, else empty
+using RasterizationOutputs = std::tuple<at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor>;
 
 // Full forward pass for C cameras: project -> colour -> tile intersect/sort ->
 // rasterize. See gsplat/rendering.py for the argument semantics.
@@ -67,7 +52,7 @@ RasterizationOutputs rasterization_3dgs(
     bool append_depth,
     bool expected_depth,
     bool packed,
-    bool segmented,
+    bool antialiased, // opacity *= compensation of the eps2d blur (Mip-Splatting 2D filter)
     bool stereo,
     bool profile
 );

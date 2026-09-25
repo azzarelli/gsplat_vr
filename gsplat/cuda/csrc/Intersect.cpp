@@ -39,7 +39,6 @@ TileIntersectResult intersect_tile(
     int64_t tile_size,
     int64_t tile_width,
     int64_t tile_height,
-    bool segmented,
     StageTimer *timer
 )
 {
@@ -56,14 +55,12 @@ TileIntersectResult intersect_tile(
     const uint32_t tile_bits   = bits_for_count(n_tiles);
     auto opt                   = depths.options();
     TORCH_CHECK(!packed || (image_ids.has_value() && gaussian_ids.has_value()), "packed inputs need image/gaussian ids");
-    TORCH_CHECK(!(packed && segmented), "segmented sort is not supported for packed inputs");
     TORCH_CHECK(image_bits + tile_bits <= 32, "(image, tile) id needs ", image_bits + tile_bits, " bits, only 32 fit");
 
     // Pass 1: tiles touched per gaussian; its cumsum is each gaussian's write
     // offset. Reading the total back is a host sync.
     at::Tensor tiles_per_gauss = at::empty_like(depths, opt.dtype(at::kInt));
     at::Tensor cum_tiles_per_gauss;
-    at::Tensor segment_offsets;
     int64_t n_isects = 0;
     if(n_elements)
     {
@@ -86,11 +83,6 @@ TileIntersectResult intersect_tile(
         );
         cum_tiles_per_gauss = at::cumsum(tiles_per_gauss.view({-1}), 0, at::kLong);
         n_isects            = cum_tiles_per_gauss[-1].item<int64_t>();
-        if(segmented)
-        {
-            segment_offsets = at::cumsum(at::sum(tiles_per_gauss, -1).view({-1}), 0, at::kLong);
-            segment_offsets = at::cat({at::zeros({1}, opt.dtype(at::kLong)), segment_offsets});
-        }
     }
 
     // Pass 2: write the (key, gaussian) pairs.
@@ -102,7 +94,7 @@ TileIntersectResult intersect_tile(
         {
             timer->mark();
         }
-        return {.tiles_per_gauss = tiles_per_gauss, .isect_ids = isect_ids, .flatten_ids = flatten_ids};
+        return {.isect_ids = isect_ids, .flatten_ids = flatten_ids};
     }
     launch_intersect_tile_kernel(
         means2d,
@@ -129,27 +121,10 @@ TileIntersectResult intersect_tile(
     // Sort by key: image, tile, then depth.
     at::Tensor isect_ids_sorted   = at::empty_like(isect_ids);
     at::Tensor flatten_ids_sorted = at::empty_like(flatten_ids);
-    if(segmented)
-    {
-        segmented_radix_sort_double_buffer(
-            n_isects,
-            I,
-            image_bits,
-            tile_bits,
-            segment_offsets,
-            isect_ids,
-            flatten_ids,
-            isect_ids_sorted,
-            flatten_ids_sorted
-        );
-    }
-    else
-    {
-        radix_sort_double_buffer(
-            n_isects, image_bits, tile_bits, isect_ids, flatten_ids, isect_ids_sorted, flatten_ids_sorted
-        );
-    }
-    return {.tiles_per_gauss = tiles_per_gauss, .isect_ids = isect_ids_sorted, .flatten_ids = flatten_ids_sorted};
+    radix_sort_double_buffer(
+        n_isects, image_bits, tile_bits, isect_ids, flatten_ids, isect_ids_sorted, flatten_ids_sorted
+    );
+    return {.isect_ids = isect_ids_sorted, .flatten_ids = flatten_ids_sorted};
 }
 
 at::Tensor intersect_offset(const at::Tensor &isect_ids, int64_t I, int64_t tile_width, int64_t tile_height)

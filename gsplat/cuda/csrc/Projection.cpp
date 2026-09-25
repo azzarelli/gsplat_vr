@@ -57,7 +57,8 @@ ProjectionDenseResult projection_ewa_3dgs_fused(
     double eps2d,
     double near_plane,
     double far_plane,
-    double radius_clip
+    double radius_clip,
+    bool antialiased
 )
 {
     DEVICE_GUARD(means);
@@ -77,6 +78,11 @@ ProjectionDenseResult projection_ewa_3dgs_fused(
     at::Tensor means2d = at::empty(with({2}), opt);
     at::Tensor depths  = at::empty(shape, opt);
     at::Tensor conics  = at::empty(with({3}), opt);
+    at::Tensor compensations;
+    if(antialiased)
+    {
+        compensations = at::empty(shape, opt);
+    }
 
     launch_projection_ewa_3dgs_fused_fwd_kernel(
         means,
@@ -97,9 +103,9 @@ ProjectionDenseResult projection_ewa_3dgs_fused(
         means2d,
         depths,
         conics,
-        c10::nullopt // compensations (antialiased mode only)
+        antialiased ? at::optional<at::Tensor>(compensations) : c10::nullopt
     );
-    return {.radii = radii, .means2d = means2d, .depths = depths, .conics = conics};
+    return {.radii = radii, .means2d = means2d, .depths = depths, .conics = conics, .compensations = compensations};
 }
 
 ProjectionPackedResult projection_ewa_3dgs_packed(
@@ -114,7 +120,8 @@ ProjectionPackedResult projection_ewa_3dgs_packed(
     double eps2d,
     double near_plane,
     double far_plane,
-    double radius_clip
+    double radius_clip,
+    bool antialiased
 )
 {
     DEVICE_GUARD(means);
@@ -150,6 +157,7 @@ ProjectionPackedResult projection_ewa_3dgs_packed(
             radius_clip,
             c10::nullopt, // block_accum
             CameraModelType::PINHOLE,
+            antialiased,
             block_cnts,
             c10::nullopt, // indptr
             c10::nullopt, // batch_ids
@@ -167,14 +175,15 @@ ProjectionPackedResult projection_ewa_3dgs_packed(
 
     // Pass 2: recompute and write the survivors.
     ProjectionPackedResult out{
-        .batch_ids    = at::empty({nnz}, opt.dtype(at::kLong)),
-        .camera_ids   = at::empty({nnz}, opt.dtype(at::kLong)),
-        .gaussian_ids = at::empty({nnz}, opt.dtype(at::kLong)),
-        .indptr       = at::empty({B * C + 1}, opt.dtype(at::kInt)),
-        .radii        = at::empty({nnz, 2}, opt.dtype(at::kInt)),
-        .means2d      = at::empty({nnz, 2}, opt),
-        .depths       = at::empty({nnz}, opt),
-        .conics       = at::empty({nnz, 3}, opt),
+        .batch_ids     = at::empty({nnz}, opt.dtype(at::kLong)),
+        .camera_ids    = at::empty({nnz}, opt.dtype(at::kLong)),
+        .gaussian_ids  = at::empty({nnz}, opt.dtype(at::kLong)),
+        .indptr        = at::empty({B * C + 1}, opt.dtype(at::kInt)),
+        .radii         = at::empty({nnz, 2}, opt.dtype(at::kInt)),
+        .means2d       = at::empty({nnz, 2}, opt),
+        .depths        = at::empty({nnz}, opt),
+        .conics        = at::empty({nnz, 3}, opt),
+        .compensations = antialiased ? at::empty({nnz}, opt) : at::Tensor(),
     };
     if(nnz)
     {
@@ -194,6 +203,7 @@ ProjectionPackedResult projection_ewa_3dgs_packed(
             radius_clip,
             block_accum,
             CameraModelType::PINHOLE,
+            antialiased,
             c10::nullopt,
             out.indptr,
             out.batch_ids,
@@ -203,7 +213,7 @@ ProjectionPackedResult projection_ewa_3dgs_packed(
             out.means2d,
             out.depths,
             out.conics,
-            c10::nullopt
+            antialiased ? at::optional<at::Tensor>(out.compensations) : c10::nullopt
         );
     }
     else

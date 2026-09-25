@@ -51,6 +51,7 @@ __global__ void projection_ewa_3dgs_packed_fwd_kernel(
     const float radius_clip,
     const int32_t *__restrict__ block_accum, // [B * C * blocks_per_row] packing helper
     const CameraModelType camera_model,
+    const bool antialiased,
     // outputs
     int32_t *__restrict__ block_cnts,    // [B * C * blocks_per_row] packing helper
     int32_t *__restrict__ indptr,        // [B * C + 1]
@@ -176,7 +177,7 @@ __global__ void projection_ewa_3dgs_packed_fwd_kernel(
         if(opacities != nullptr)
         {
             float opacity = opacities[bid * N + gid];
-            if(compensations != nullptr)
+            if(antialiased)
             {
                 // we assume compensation term will be applied later on.
                 opacity *= compensation;
@@ -296,6 +297,7 @@ void launch_projection_ewa_3dgs_packed_fwd_kernel(
     const float radius_clip,
     const at::optional<at::Tensor> block_accum, // [B * C * blocks_per_row] packing helper
     const CameraModelType camera_model,
+    const bool antialiased,
     // outputs
     at::optional<at::Tensor> block_cnts,   // [B * C * blocks_per_row] packing helper
     at::optional<at::Tensor> indptr,       // [B * C + 1]
@@ -362,6 +364,7 @@ void launch_projection_ewa_3dgs_packed_fwd_kernel(
                     radius_clip,
                     block_accum.has_value() ? block_accum.value().const_data_ptr<int32_t>() : nullptr,
                     camera_model,
+                    antialiased,
                     block_cnts.has_value() ? block_cnts.value().data_ptr<int32_t>() : nullptr,
                     indptr.has_value() ? indptr.value().data_ptr<int32_t>() : nullptr,
                     batch_ids.has_value() ? batch_ids.value().data_ptr<int64_t>() : nullptr,

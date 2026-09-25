@@ -44,7 +44,7 @@ def rasterization(
     tile_size: int = 16,
     backgrounds: Optional[Tensor] = None,  # [C, D]
     render_mode: RenderMode = "RGB",
-    segmented: bool = False,
+    antialiased: bool = False,
     stereo: bool = False,
     profile: bool = False,
 ) -> Tuple[Tensor, Tensor, Dict]:
@@ -54,10 +54,15 @@ def rasterization(
     X is D colour channels, +1 depth channel for "RGB+D"/"RGB+ED", or just
     the depth channel for "D"/"ED". "D" is alpha-weighted depth; "ED" divides
     it by alpha.
+    meta: n_entries (projected (camera, gaussian) entries: survivors if packed,
+    else C * N), n_isects (gaussian-tile overlaps) and stage_ms.
 
     packed: keep only the (camera, gaussian) pairs that survive culling.
-        packed=False keeps every pair, colours them in one fused SH+depth
-        kernel and allows `segmented` (per-image) sorting.
+        packed=False keeps every pair and colours them in one fused SH+depth
+        kernel.
+    antialiased: scale each opacity by sqrt(det(cov) / det(cov + eps2d * I)),
+        the Mip-Splatting 2D filter. Use for models trained with it, with eps2d
+        set to the training kernel size.
     stereo: packed with C == 2 only. Evaluates SH once per gaussian from the
         midpoint of the two cameras and shares it between the eyes.
     profile: time each stage with CUDA events into meta["stage_ms"] (syncs).
@@ -73,22 +78,7 @@ def rasterization(
 
     from .cuda._backend import _C
 
-    (
-        render_colors,
-        render_alphas,
-        camera_ids,
-        gaussian_ids,
-        radii,
-        means2d,
-        depths,
-        conics,
-        proj_opacities,
-        tiles_per_gauss,
-        isect_ids,
-        flatten_ids,
-        isect_offsets,
-        stage_ms,
-    ) = _C.rasterization_3dgs(
+    render_colors, render_alphas, n_entries, n_isects, stage_ms = _C.rasterization_3dgs(
         means.contiguous(),
         quats.contiguous(),
         scales.contiguous(),
@@ -108,29 +98,14 @@ def rasterization(
         render_mode != "RGB",  # append depth
         render_mode in ("ED", "RGB+ED"),  # expected depth
         packed,
-        segmented,
+        antialiased,
         stereo,
         profile,
     )
 
     meta = {
-        "camera_ids": camera_ids,  # packed only, else None
-        "gaussian_ids": gaussian_ids,  # packed only, else None
-        "radii": radii,
-        "means2d": means2d,
-        "depths": depths,
-        "conics": conics,
-        "opacities": proj_opacities,
-        "tiles_per_gauss": tiles_per_gauss,
-        "isect_ids": isect_ids,
-        "flatten_ids": flatten_ids,
-        "isect_offsets": isect_offsets,
-        "tile_width": isect_offsets.shape[-1],
-        "tile_height": isect_offsets.shape[-2],
-        "tile_size": tile_size,
-        "width": width,
-        "height": height,
-        "n_cameras": viewmats.shape[0],
+        "n_entries": n_entries,
+        "n_isects": n_isects,
         "stage_ms": dict(zip(_STAGES, stage_ms.tolist())),
     }
     return render_colors, render_alphas, meta

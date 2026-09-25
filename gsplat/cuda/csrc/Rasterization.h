@@ -58,7 +58,6 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     const at::Tensor flatten_ids,
     // outputs
     at::Tensor renders,
-    at::Tensor alphas,
-    at::Tensor last_ids // [..., H, W] index of the last contributing entry (backward only)
+    at::Tensor alphas
 );
 } // namespace gsplat

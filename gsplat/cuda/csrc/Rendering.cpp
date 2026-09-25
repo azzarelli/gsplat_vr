@@ -57,9 +57,7 @@ namespace
         const at::optional<at::Tensor> &backgrounds,
         int64_t tile_size,
         int64_t sh_degree,
-        bool append_depth,
-        bool packed,
-        bool segmented
+        bool append_depth
     )
     {
         TORCH_CHECK(means.dim() == 2 && means.size(1) == 3, "means must be [N, 3], got ", means.sizes());
@@ -76,7 +74,6 @@ namespace
         TORCH_CHECK(Ks.sizes() == at::IntArrayRef({C, 3, 3}), "Ks must be [C, 3, 3], got ", Ks.sizes());
         TORCH_CHECK(tile_size == 4 || tile_size == 16, "tile_size must be 4 or 16, got ", tile_size);
         TORCH_CHECK(colors.has_value() || append_depth, "nothing to render: no colors and no depth");
-        TORCH_CHECK(!(packed && segmented), "segmented sort is only supported with packed=False");
         if(colors.has_value())
         {
             const at::Tensor &c = colors.value();
@@ -235,7 +232,7 @@ RasterizationOutputs rasterization_3dgs(
     bool append_depth,
     bool expected_depth,
     bool packed,
-    bool segmented,
+    bool antialiased,
     bool stereo,
     bool profile
 )
@@ -252,9 +249,7 @@ RasterizationOutputs rasterization_3dgs(
         backgrounds,
         tile_size,
         sh_degree,
-        append_depth,
-        packed,
-        segmented
+        append_depth
     );
     const int64_t N = means.size(0);
     const int64_t C = viewmats.size(0);
@@ -265,7 +260,8 @@ RasterizationOutputs rasterization_3dgs(
     if(packed)
     {
         ProjectionPackedResult p = projection_ewa_3dgs_packed(
-            means, quats, scales, opacities, viewmats, Ks, image_width, image_height, eps2d, near_plane, far_plane, radius_clip
+            means, quats, scales, opacities, viewmats, Ks, image_width, image_height, eps2d, near_plane, far_plane, radius_clip,
+            antialiased
         );
         batch_ids      = p.batch_ids; // all 0: one scene, no batch dims
         camera_ids     = p.camera_ids;
@@ -275,17 +271,22 @@ RasterizationOutputs rasterization_3dgs(
         depths         = p.depths;
         conics         = p.conics;
         proj_opacities = opacities.index({gaussian_ids});
+        if(antialiased)
+        {
+            proj_opacities.mul_(p.compensations);
+        }
     }
     else
     {
         ProjectionDenseResult p = projection_ewa_3dgs_fused(
-            means, quats, scales, opacities, viewmats, Ks, image_width, image_height, eps2d, near_plane, far_plane, radius_clip
+            means, quats, scales, opacities, viewmats, Ks, image_width, image_height, eps2d, near_plane, far_plane, radius_clip,
+            antialiased
         );
         radii          = p.radii;
         means2d        = p.means2d;
         depths         = p.depths;
         conics         = p.conics;
-        proj_opacities = opacities.unsqueeze(0).expand({C, N});
+        proj_opacities = antialiased ? opacities.unsqueeze(0) * p.compensations : opacities.unsqueeze(0).expand({C, N});
     }
     const at::Tensor valid = radii.gt(0).all(-1); // culled entries have zero radius
     timer.mark();
@@ -361,7 +362,6 @@ RasterizationOutputs rasterization_3dgs(
         tile_size,
         tile_width,
         tile_height,
-        segmented,
         &timer
     );
     at::Tensor isect_offsets = intersect_offset(isects.isect_ids, C, tile_width, tile_height);
@@ -392,21 +392,6 @@ RasterizationOutputs rasterization_3dgs(
     }
     timer.mark();
 
-    return {
-        render_colors,
-        raster.alphas,
-        camera_ids,
-        gaussian_ids,
-        radii,
-        means2d,
-        depths,
-        conics,
-        proj_opacities,
-        isects.tiles_per_gauss,
-        isects.isect_ids,
-        isects.flatten_ids,
-        isect_offsets,
-        timer.elapsed_ms(),
-    };
+    return {render_colors, raster.alphas, depths.numel(), isects.flatten_ids.size(0), timer.elapsed_ms()};
 }
 } // namespace gsplat

@@ -20,24 +20,15 @@
 
 #include "Common.h"
 
-// Per-(gaussian, pixel) alpha-blending math for 3DGS rasterization, shared by
-// the dense and sparse rasterizers so the numerically sensitive forward and
-// backward steps live in one place. These describe the contribution of a single
-// gaussian to a single pixel; tile iteration, pixel addressing, shared-memory
-// batching and warp reductions stay in the kernels.
+// Per-(gaussian, pixel) alpha-blending math for 3DGS rasterization.
 
 namespace gsplat
 {
-// Per-(gaussian, pixel) gaussian-weight evaluation shared by every 3DGS
-// conic-based kernel. Computes the Mahalanobis exponent from the conic and the
-// pixel offset (dx, dy) = (mean - pixel), the resulting alpha (clamped to
-// MAX_ALPHA), and whether the sample contributes. `valid == false` means the
-// caller skips this gaussian (negative exponent or sub-threshold alpha). `vis`
-// (== exp(-sigma)) is retained for the backward pass, which needs it directly.
+// Alpha of one gaussian at pixel offset (dx, dy) = (mean - pixel), clamped to
+// MAX_ALPHA. `valid == false`: negative exponent or sub-threshold alpha, skip it.
 struct GaussianWeight
 {
-    float vis;   // __expf(-sigma)
-    float alpha; // min(MAX_ALPHA, opac * vis)
+    float alpha; // min(MAX_ALPHA, opac * exp(-sigma))
     bool valid;  // sigma >= 0 and alpha >= ALPHA_THRESHOLD
 };
 
@@ -45,10 +36,8 @@ __device__ __forceinline__ GaussianWeight
     eval_gaussian_weight(const vec3 &conic, const float dx, const float dy, const float opac)
 {
     const float sigma = 0.5f * (conic.x * dx * dx + conic.z * dy * dy) + conic.y * dx * dy;
-    const float vis   = __expf(-sigma);
-    const float alpha = min(MAX_ALPHA, opac * vis);
+    const float alpha = min(MAX_ALPHA, opac * __expf(-sigma));
     GaussianWeight out;
-    out.vis   = vis;
     out.alpha = alpha;
     out.valid = !(sigma < 0.f || alpha < ALPHA_THRESHOLD);
     return out;
