@@ -16,369 +16,315 @@
  * limitations under the License.
  */
 
-#include <ATen/Dispatch.h>
 #include <ATen/core/Tensor.h>
-#include <ATen/cuda/Atomic.cuh>
 #include <c10/cuda/CUDAStream.h>
-#include <cooperative_groups.h>
 #include <cub/cub.cuh>
 
 #include "Common.h"
+#include "Dispatch.h"
 #include "Projection.h"
 #include "Utils.cuh"
 
 namespace gsplat
 {
-namespace cg = cooperative_groups;
+namespace
+{
+    // One camera's view of one gaussian.
+    struct CameraProjection
+    {
+        vec2 mean2d;
+        vec3 conic; // upper triangle of the inverse 2D covariance
+        float depth;
+        float opacity; // times the blur compensation when antialiased
+        int32_t radius_x;
+        int32_t radius_y;
+    };
+} // namespace
 
-template<typename scalar_t>
-__global__ void projection_ewa_3dgs_packed_fwd_kernel(
-    const uint32_t B,
-    const uint32_t C,
+// One thread per gaussian, projected into all C cameras: the 3D covariance is
+// built once and shared, each camera gets its own 2D projection and culling.
+// Pass 1 (block_cnts) counts survivors per block and camera, plus gaussians
+// kept by any camera. Pass 2 (block_accum, their inclusive cumsums) writes the
+// survivors camera-major in ascending gaussian order, the union's ids, and
+// each entry's slot in the union.
+template<uint32_t C>
+__global__ void projection_ewa_3dgs_packed_kernel(
     const uint32_t N,
-    const scalar_t *__restrict__ means,     // [B, N, 3]
-    const scalar_t *__restrict__ covars,    // [B, N, 6] Optional
-    const scalar_t *__restrict__ quats,     // [B, N, 4] Optional
-    const scalar_t *__restrict__ scales,    // [B, N, 3] Optional
-    const scalar_t *__restrict__ opacities, // [B, N] optional
-    const scalar_t *__restrict__ viewmats,  // [B, C, 4, 4]
-    const scalar_t *__restrict__ Ks,        // [B, C, 3, 3]
+    const float *__restrict__ means,     // [N, 3]
+    const float *__restrict__ covars,    // [N, 6] optional, else quats + scales
+    const float *__restrict__ quats,     // [N, 4]
+    const float *__restrict__ scales,    // [N, 3]
+    const float *__restrict__ opacities, // [N]
+    const float *__restrict__ viewmats,  // [C, 4, 4]
+    const float *__restrict__ Ks,        // [C, 3, 3]
     const uint32_t image_width,
     const uint32_t image_height,
     const float eps2d,
     const float near_plane,
     const float far_plane,
     const float radius_clip,
-    const int32_t *__restrict__ block_accum, // [B * C * blocks_per_row] packing helper
-    const CameraModelType camera_model,
     const bool antialiased,
-    // outputs
-    int32_t *__restrict__ block_cnts,    // [B * C * blocks_per_row] packing helper
-    int32_t *__restrict__ indptr,        // [B * C + 1]
-    int64_t *__restrict__ batch_ids,     // [nnz]
-    int64_t *__restrict__ camera_ids,    // [nnz]
-    int64_t *__restrict__ gaussian_ids,  // [nnz]
-    int32_t *__restrict__ radii,         // [nnz, 2]
-    scalar_t *__restrict__ means2d,      // [nnz, 2]
-    scalar_t *__restrict__ depths,       // [nnz]
-    scalar_t *__restrict__ conics,       // [nnz, 3]
-    scalar_t *__restrict__ compensations // [nnz] optional
+    const bool with_union,
+    // pass 1
+    int32_t *__restrict__ block_cnts, // [C + with_union, n_blocks]
+    // pass 2
+    const int32_t *__restrict__ block_accum, // [C + with_union, n_blocks], cumsum per row
+    int64_t *__restrict__ batch_ids,         // [nnz]
+    int64_t *__restrict__ camera_ids,        // [nnz]
+    int64_t *__restrict__ gaussian_ids,      // [nnz]
+    int32_t *__restrict__ radii,             // [nnz, 2]
+    float *__restrict__ means2d,             // [nnz, 2]
+    float *__restrict__ depths,              // [nnz]
+    float *__restrict__ conics,              // [nnz, 3]
+    float *__restrict__ proj_opacities,      // [nnz]
+    int64_t *__restrict__ union_ids,         // [U]
+    int64_t *__restrict__ union_slots        // [nnz]
 )
 {
-    int32_t blocks_per_row = gridDim.x;
-    int32_t row_idx        = blockIdx.y;
-    int32_t block_col_idx  = blockIdx.x;
-    int32_t block_idx      = row_idx * blocks_per_row + block_col_idx;
-    int32_t col_idx        = block_col_idx * blockDim.x + threadIdx.x;
-    const int32_t bid      = row_idx / C;
-    const int32_t cid      = row_idx % C;
-    const int32_t gid      = col_idx;
+    const uint32_t n_blocks = gridDim.x;
+    const uint32_t gid      = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool first_pass   = block_cnts != nullptr;
 
-    bool valid = (bid < B) && (cid < C) && (gid < N);
-
-    // check if points are with camera near and far plane
-    vec3 mean_c;
-    mat3 R;
-    if(valid)
+    CameraProjection proj[C];
+    uint32_t visible = 0; // bit c: kept by camera c
+    if(gid < N)
     {
-        // shift pointers to the current camera and gaussian
-        means    += bid * N * 3 + gid * 3;
-        viewmats += bid * C * 16 + cid * 16;
-
-        // glm is column-major but input is row-major
-        R = mat3(
-            viewmats[0],
-            viewmats[4],
-            viewmats[8], // 1st column
-            viewmats[1],
-            viewmats[5],
-            viewmats[9], // 2nd column
-            viewmats[2],
-            viewmats[6],
-            viewmats[10] // 3rd column
-        );
-        vec3 t = vec3(viewmats[3], viewmats[7], viewmats[11]);
-
-        // transform Gaussian center to camera space
-        posW2C(R, t, glm::make_vec3(means), mean_c);
-        if(mean_c.z < near_plane || mean_c.z > far_plane)
-        {
-            valid = false;
-        }
-    }
-
-    // check if the perspective projection is valid.
-    mat2 covar2d;
-    vec2 mean2d;
-    mat2 covar2d_inv;
-    float compensation;
-    float det;
-    if(valid)
-    {
-        // transform Gaussian covariance to camera space
+        const vec3 mean_w = glm::make_vec3(means + gid * 3);
         mat3 covar;
-        if(covars != nullptr)
+        bool have_covar = false;
+#pragma unroll
+        for(uint32_t c = 0; c < C; ++c)
         {
-            // if a precomputed covariance is provided
-            covars += bid * N * 6 + gid * 6;
-            covar   = mat3(
-                covars[0],
-                covars[1],
-                covars[2], // 1st column
-                covars[1],
-                covars[3],
-                covars[4], // 2nd column
-                covars[2],
-                covars[4],
-                covars[5] // 3rd column
-            );
-        }
-        else
-        {
-            // if not then compute it from quaternions and scales
-            quats  += bid * N * 4 + gid * 4;
-            scales += bid * N * 3 + gid * 3;
-            quat_scale_to_covar_preci(glm::make_vec4(quats), glm::make_vec3(scales), &covar, nullptr);
-        }
-        mat3 covar_c;
-        covarW2C(R, covar, covar_c);
+            // glm is column-major but viewmats are row-major
+            const float *vm = viewmats + c * 16;
+            const mat3 R    = mat3(vm[0], vm[4], vm[8], vm[1], vm[5], vm[9], vm[2], vm[6], vm[10]);
+            const vec3 t    = vec3(vm[3], vm[7], vm[11]);
+            vec3 mean_c;
+            posW2C(R, t, mean_w, mean_c);
+            if(mean_c.z < near_plane || mean_c.z > far_plane)
+            {
+                continue;
+            }
 
-        Ks += bid * C * 9 + cid * 9;
-        switch(camera_model)
-        {
-        case CameraModelType::PINHOLE: // perspective projection
-            persp_proj(mean_c, covar_c, Ks[0], Ks[4], Ks[2], Ks[5], image_width, image_height, covar2d, mean2d);
-            break;
-        case CameraModelType::ORTHO: // orthographic projection
-            ortho_proj(mean_c, covar_c, Ks[0], Ks[4], Ks[2], Ks[5], image_width, image_height, covar2d, mean2d);
-            break;
-        case CameraModelType::FISHEYE: // fisheye projection
-            fisheye_proj(mean_c, covar_c, Ks[0], Ks[4], Ks[2], Ks[5], image_width, image_height, covar2d, mean2d);
-            break;
-        }
+            if(!have_covar)
+            {
+                if(covars != nullptr)
+                {
+                    const float *cv = covars + gid * 6;
+                    covar           = mat3(cv[0], cv[1], cv[2], cv[1], cv[3], cv[4], cv[2], cv[4], cv[5]);
+                }
+                else
+                {
+                    quat_scale_to_covar_preci(
+                        glm::make_vec4(quats + gid * 4), glm::make_vec3(scales + gid * 3), &covar, nullptr
+                    );
+                }
+                have_covar = true;
+            }
+            mat3 covar_c;
+            covarW2C(R, covar, covar_c);
 
-        det = add_blur(eps2d, covar2d, compensation);
-        if(det <= 0.f)
-        {
-            valid = false;
-        }
-        else
-        {
-            // compute the inverse of the 2d covariance
-            covar2d_inv = glm::inverse(covar2d);
-        }
-    }
+            const float *K = Ks + c * 9;
+            mat2 covar2d;
+            vec2 mean2d;
+            persp_proj(mean_c, covar_c, K[0], K[4], K[2], K[5], image_width, image_height, covar2d, mean2d);
 
-    // check if the points are in the image region
-    float radius_x, radius_y;
-    if(valid)
-    {
-        float extend = GAUSSIAN_EXTEND;
-        if(opacities != nullptr)
-        {
-            float opacity = opacities[bid * N + gid];
+            float compensation;
+            const float det = add_blur(eps2d, covar2d, compensation);
+            if(det <= 0.f)
+            {
+                continue;
+            }
+
+            float opacity = opacities[gid];
             if(antialiased)
             {
-                // we assume compensation term will be applied later on.
                 opacity *= compensation;
             }
             if(opacity < ALPHA_THRESHOLD)
             {
-                valid = false;
+                continue;
             }
-            // Compute opacity-aware bounding box.
-            // https://arxiv.org/pdf/2402.00525 Section B.2
-            extend = min(GAUSSIAN_EXTEND, sqrt(2.0f * __logf(opacity / ALPHA_THRESHOLD)));
-        }
+            // Opacity-aware tight bounding box, https://arxiv.org/pdf/2402.00525 Section B.2
+            const float extend   = min(GAUSSIAN_EXTEND, sqrt(2.0f * __logf(opacity / ALPHA_THRESHOLD)));
+            const float radius_x = ceilf(extend * sqrtf(covar2d[0][0]));
+            const float radius_y = ceilf(extend * sqrtf(covar2d[1][1]));
+            if(radius_x <= radius_clip && radius_y <= radius_clip)
+            {
+                continue;
+            }
+            if(mean2d.x + radius_x <= 0
+               || mean2d.x - radius_x >= image_width
+               || mean2d.y + radius_y <= 0
+               || mean2d.y - radius_y >= image_height)
+            {
+                continue;
+            }
 
-        // compute tight rectangular bounding box (non differentiable)
-        // https://arxiv.org/pdf/2402.00525
-        radius_x = ceilf(extend * sqrtf(covar2d[0][0]));
-        radius_y = ceilf(extend * sqrtf(covar2d[1][1]));
-
-        if(radius_x <= radius_clip && radius_y <= radius_clip)
-        {
-            valid = false;
-        }
-
-        // mask out gaussians outside the image region
-        if(mean2d.x + radius_x <= 0
-           || mean2d.x - radius_x >= image_width
-           || mean2d.y + radius_y <= 0
-           || mean2d.y - radius_y >= image_height)
-        {
-            valid = false;
+            visible |= 1u << c;
+            if(!first_pass)
+            {
+                const mat2 covar2d_inv = glm::inverse(covar2d);
+                proj[c]                = {
+                    mean2d,
+                    vec3(covar2d_inv[0][0], covar2d_inv[0][1], covar2d_inv[1][1]),
+                    mean_c.z,
+                    opacity,
+                    static_cast<int32_t>(radius_x),
+                    static_cast<int32_t>(radius_y),
+                };
+            }
         }
     }
 
-    int32_t thread_data = static_cast<int32_t>(valid);
-    if(block_cnts != nullptr)
+    if(first_pass)
     {
-        // First pass: compute the block-wide sum
-        int32_t aggregate;
-        if(__syncthreads_or(thread_data))
+        using BlockReduce = cub::BlockReduce<int32_t, N_THREADS_PACKED>;
+        __shared__ typename BlockReduce::TempStorage reduce_storage;
+#pragma unroll
+        for(uint32_t c = 0; c <= C; ++c)
         {
-            typedef cub::BlockReduce<int32_t, N_THREADS_PACKED> BlockReduce;
-            __shared__ typename BlockReduce::TempStorage temp_storage;
-            aggregate = BlockReduce(temp_storage).Sum(thread_data);
+            if(c == C && !with_union)
+            {
+                break;
+            }
+            const int32_t keep  = c < C ? (visible >> c) & 1u : visible != 0;
+            const int32_t count = BlockReduce(reduce_storage).Sum(keep);
+            if(threadIdx.x == 0)
+            {
+                block_cnts[c * n_blocks + blockIdx.x] = count;
+            }
+            __syncthreads(); // before reduce_storage is reused
         }
-        else
+        return;
+    }
+
+    using BlockScan = cub::BlockScan<int32_t, N_THREADS_PACKED>;
+    __shared__ typename BlockScan::TempStorage scan_storage;
+    auto write_offset = [&](const uint32_t row, const int32_t keep)
+    {
+        int32_t rank;
+        BlockScan(scan_storage).ExclusiveSum(keep, rank);
+        __syncthreads(); // before scan_storage is reused
+        // camera rows are cumsummed as one array, so this runs on across rows
+        const uint32_t cell = row * n_blocks + blockIdx.x;
+        const int32_t base  = cell == 0 ? 0 : block_accum[cell - 1];
+        return static_cast<int64_t>(base) + rank;
+    };
+
+    int64_t slot = 0;
+    if(with_union)
+    {
+        // union row is cumsummed on its own, so its first block starts at 0
+        int32_t rank;
+        BlockScan(scan_storage).ExclusiveSum(static_cast<int32_t>(visible != 0), rank);
+        __syncthreads();
+        const int32_t base = blockIdx.x == 0 ? 0 : block_accum[C * n_blocks + blockIdx.x - 1];
+        slot               = static_cast<int64_t>(base) + rank;
+        if(visible != 0)
         {
-            aggregate = 0;
-        }
-        if(threadIdx.x == 0)
-        {
-            block_cnts[block_idx] = aggregate;
+            union_ids[slot] = gid;
         }
     }
-    else
+
+#pragma unroll
+    for(uint32_t c = 0; c < C; ++c)
     {
-        // Second pass: write out the indices of the non zero elements
-        if(__syncthreads_or(thread_data))
+        const bool keep = (visible >> c) & 1u;
+        const int64_t e = write_offset(c, keep);
+        if(!keep)
         {
-            typedef cub::BlockScan<int32_t, N_THREADS_PACKED> BlockScan;
-            __shared__ typename BlockScan::TempStorage temp_storage;
-            BlockScan(temp_storage).ExclusiveSum(thread_data, thread_data);
+            continue;
         }
-        if(valid)
+        const CameraProjection &p = proj[c];
+        batch_ids[e]              = 0;
+        camera_ids[e]             = c;
+        gaussian_ids[e]           = gid;
+        radii[e * 2]              = p.radius_x;
+        radii[e * 2 + 1]          = p.radius_y;
+        means2d[e * 2]            = p.mean2d.x;
+        means2d[e * 2 + 1]        = p.mean2d.y;
+        depths[e]                 = p.depth;
+        conics[e * 3]             = p.conic.x;
+        conics[e * 3 + 1]         = p.conic.y;
+        conics[e * 3 + 2]         = p.conic.z;
+        proj_opacities[e]         = p.opacity;
+        if(with_union)
         {
-            if(block_idx > 0)
-            {
-                int32_t offset  = block_accum[block_idx - 1];
-                thread_data    += offset;
-            }
-            // write to outputs
-            batch_ids[thread_data]       = bid;
-            camera_ids[thread_data]      = cid;
-            gaussian_ids[thread_data]    = gid;
-            radii[thread_data * 2]       = (int32_t)radius_x;
-            radii[thread_data * 2 + 1]   = (int32_t)radius_y;
-            means2d[thread_data * 2]     = mean2d.x;
-            means2d[thread_data * 2 + 1] = mean2d.y;
-            depths[thread_data]          = mean_c.z;
-            conics[thread_data * 3]      = covar2d_inv[0][0];
-            conics[thread_data * 3 + 1]  = covar2d_inv[0][1];
-            conics[thread_data * 3 + 2]  = covar2d_inv[1][1];
-            if(compensations != nullptr)
-            {
-                compensations[thread_data] = compensation;
-            }
-        }
-        // lane 0 of the first block in each row writes the indptr
-        if(threadIdx.x == 0 && block_col_idx == 0)
-        {
-            if(row_idx == 0)
-            {
-                indptr[0]     = 0;
-                indptr[B * C] = block_accum[B * C * blocks_per_row - 1];
-            }
-            else
-            {
-                indptr[row_idx] = block_accum[block_idx - 1];
-            }
+            union_slots[e] = slot;
         }
     }
 }
 
-void launch_projection_ewa_3dgs_packed_fwd_kernel(
-    // inputs
-    const at::Tensor means,                   // [..., N, 3]
-    const at::optional<at::Tensor> covars,    // [..., N, 6] optional
-    const at::optional<at::Tensor> quats,     // [..., N, 4] optional
-    const at::optional<at::Tensor> scales,    // [..., N, 3] optional
-    const at::optional<at::Tensor> opacities, // [..., N] optional
-    const at::Tensor viewmats,                // [..., C, 4, 4]
-    const at::Tensor Ks,                      // [..., C, 3, 3]
+void launch_projection_ewa_3dgs_packed_kernel(
+    const at::Tensor means,
+    const at::optional<at::Tensor> covars,
+    const at::Tensor quats,
+    const at::Tensor scales,
+    const at::Tensor opacities,
+    const at::Tensor viewmats,
+    const at::Tensor Ks,
     const uint32_t image_width,
     const uint32_t image_height,
     const float eps2d,
     const float near_plane,
     const float far_plane,
     const float radius_clip,
-    const at::optional<at::Tensor> block_accum, // [B * C * blocks_per_row] packing helper
-    const CameraModelType camera_model,
     const bool antialiased,
-    // outputs
-    at::optional<at::Tensor> block_cnts,   // [B * C * blocks_per_row] packing helper
-    at::optional<at::Tensor> indptr,       // [B * C + 1]
-    at::optional<at::Tensor> batch_ids,    // [nnz]
-    at::optional<at::Tensor> camera_ids,   // [nnz]
-    at::optional<at::Tensor> gaussian_ids, // [nnz]
-    at::optional<at::Tensor> radii,        // [nnz, 2]
-    at::optional<at::Tensor> means2d,      // [nnz, 2]
-    at::optional<at::Tensor> depths,       // [nnz]
-    at::optional<at::Tensor> conics,       // [nnz, 3]
-    at::optional<at::Tensor> compensations // [nnz] optional
+    const bool with_union,
+    at::optional<at::Tensor> block_cnts,
+    at::optional<at::Tensor> block_accum,
+    const ProjectionPackedResult *out
 )
 {
-    uint32_t N = means.size(-2);          // number of gaussians
-    uint32_t C = viewmats.size(-3);       // number of cameras
-    uint32_t B = means.numel() / (N * 3); // number of batches
-
-    uint32_t nrows          = B * C;
-    uint32_t ncols          = N;
-    uint32_t blocks_per_row = (ncols + N_THREADS_PACKED - 1) / N_THREADS_PACKED;
-
-    dim3 threads(N_THREADS_PACKED);
-    // Each block-row maps one B*C batch-camera onto grid.y, so a larger B*C
-    // would silently issue an invalid launch -- reject it with a clear error.
-    TORCH_CHECK(
-        nrows <= kMaxCudaGridDimY,
-        "packed projection: B*C = ",
-        nrows,
-        " exceeds the CUDA grid.y limit of ",
-        kMaxCudaGridDimY,
-        " batch-camera rows per launch"
-    );
-    dim3 grid(blocks_per_row, nrows, 1);
-    int64_t shmem_size = 0; // No shared memory used in this kernel
-
-    if(B == 0 || N == 0 || C == 0)
+    const uint32_t N = means.size(0);
+    const uint32_t C = viewmats.size(0);
+    if(N == 0)
     {
-        // skip the kernel launch if there are no elements
         return;
     }
+    const uint32_t n_blocks = (N + N_THREADS_PACKED - 1) / N_THREADS_PACKED;
+    auto ptr                = [](const at::Tensor &t) { return t.defined() ? t.data_ptr() : nullptr; };
 
-    AT_DISPATCH_FLOATING_TYPES(
-        means.scalar_type(),
-        "projection_ewa_3dgs_packed_fwd_kernel",
-        [&]()
+    const bool dispatched = dispatch::dispatch(
+        dispatch::IntParam<1, 2, 3, 4>{static_cast<int>(C)},
+        [&]<typename CamConst>()
         {
-            projection_ewa_3dgs_packed_fwd_kernel<scalar_t>
-                <<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
-                    B,
-                    C,
+            projection_ewa_3dgs_packed_kernel<CamConst::value>
+                <<<n_blocks, N_THREADS_PACKED, 0, at::cuda::getCurrentCUDAStream()>>>(
                     N,
-                    means.const_data_ptr<scalar_t>(),
-                    covars.has_value() ? covars.value().const_data_ptr<scalar_t>() : nullptr,
-                    quats.has_value() ? quats.value().const_data_ptr<scalar_t>() : nullptr,
-                    scales.has_value() ? scales.value().const_data_ptr<scalar_t>() : nullptr,
-                    opacities.has_value() ? opacities.value().const_data_ptr<scalar_t>() : nullptr,
-                    viewmats.const_data_ptr<scalar_t>(),
-                    Ks.const_data_ptr<scalar_t>(),
+                    means.const_data_ptr<float>(),
+                    covars.has_value() ? covars.value().const_data_ptr<float>() : nullptr,
+                    quats.const_data_ptr<float>(),
+                    scales.const_data_ptr<float>(),
+                    opacities.const_data_ptr<float>(),
+                    viewmats.const_data_ptr<float>(),
+                    Ks.const_data_ptr<float>(),
                     image_width,
                     image_height,
                     eps2d,
                     near_plane,
                     far_plane,
                     radius_clip,
-                    block_accum.has_value() ? block_accum.value().const_data_ptr<int32_t>() : nullptr,
-                    camera_model,
                     antialiased,
+                    with_union,
                     block_cnts.has_value() ? block_cnts.value().data_ptr<int32_t>() : nullptr,
-                    indptr.has_value() ? indptr.value().data_ptr<int32_t>() : nullptr,
-                    batch_ids.has_value() ? batch_ids.value().data_ptr<int64_t>() : nullptr,
-                    camera_ids.has_value() ? camera_ids.value().data_ptr<int64_t>() : nullptr,
-                    gaussian_ids.has_value() ? gaussian_ids.value().data_ptr<int64_t>() : nullptr,
-                    radii.has_value() ? radii.value().data_ptr<int32_t>() : nullptr,
-                    means2d.has_value() ? means2d.value().data_ptr<scalar_t>() : nullptr,
-                    depths.has_value() ? depths.value().data_ptr<scalar_t>() : nullptr,
-                    conics.has_value() ? conics.value().data_ptr<scalar_t>() : nullptr,
-                    compensations.has_value() ? compensations.value().data_ptr<scalar_t>() : nullptr
+                    block_accum.has_value() ? block_accum.value().const_data_ptr<int32_t>() : nullptr,
+                    out ? static_cast<int64_t *>(ptr(out->batch_ids)) : nullptr,
+                    out ? static_cast<int64_t *>(ptr(out->camera_ids)) : nullptr,
+                    out ? static_cast<int64_t *>(ptr(out->gaussian_ids)) : nullptr,
+                    out ? static_cast<int32_t *>(ptr(out->radii)) : nullptr,
+                    out ? static_cast<float *>(ptr(out->means2d)) : nullptr,
+                    out ? static_cast<float *>(ptr(out->depths)) : nullptr,
+                    out ? static_cast<float *>(ptr(out->conics)) : nullptr,
+                    out ? static_cast<float *>(ptr(out->opacities)) : nullptr,
+                    out ? static_cast<int64_t *>(ptr(out->union_ids)) : nullptr,
+                    out ? static_cast<int64_t *>(ptr(out->union_slots)) : nullptr
                 );
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
     );
+    TORCH_CHECK(dispatched, "packed projection supports 1 to 4 cameras, got ", C);
 }
 
 } // namespace gsplat
-

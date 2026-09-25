@@ -53,34 +53,39 @@ ProjectionDenseResult projection_ewa_3dgs_fused(
 );
 
 // Same projection, but only the surviving (camera, gaussian) pairs are kept,
-// sorted by image then gaussian id. Costs a host sync to learn nnz.
+// camera-major and in ascending gaussian order. One thread per gaussian covers
+// every camera, sharing its 3D covariance. Costs a host sync to learn nnz (and
+// U). with_union also lists the gaussians kept by any camera and each entry's
+// slot in that list, for colour shared across cameras.
 struct ProjectionPackedResult
 {
-    at::Tensor batch_ids;     // [nnz] int64
-    at::Tensor camera_ids;    // [nnz] int64
-    at::Tensor gaussian_ids;  // [nnz] int64
-    at::Tensor indptr;        // [B * C + 1] int32, row offsets per image
-    at::Tensor radii;         // [nnz, 2] int32
-    at::Tensor means2d;       // [nnz, 2]
-    at::Tensor depths;        // [nnz]
-    at::Tensor conics;        // [nnz, 3]
-    at::Tensor compensations; // [nnz], antialiased only
+    at::Tensor batch_ids;    // [nnz] int64, all 0
+    at::Tensor camera_ids;   // [nnz] int64
+    at::Tensor gaussian_ids; // [nnz] int64
+    at::Tensor radii;        // [nnz, 2] int32
+    at::Tensor means2d;      // [nnz, 2]
+    at::Tensor depths;       // [nnz]
+    at::Tensor conics;       // [nnz, 3]
+    at::Tensor opacities;    // [nnz], times the blur compensation when antialiased
+    at::Tensor union_ids;    // [U] int64, ascending; with_union only
+    at::Tensor union_slots;  // [nnz] int64, entry -> index in union_ids; with_union only
 };
 
 ProjectionPackedResult projection_ewa_3dgs_packed(
-    const at::Tensor &means,
-    const at::Tensor &quats,
-    const at::Tensor &scales,
-    const at::Tensor &opacities,
-    const at::Tensor &viewmats,
-    const at::Tensor &Ks,
+    const at::Tensor &means,     // [N, 3]
+    const at::Tensor &quats,     // [N, 4]
+    const at::Tensor &scales,    // [N, 3]
+    const at::Tensor &opacities, // [N]
+    const at::Tensor &viewmats,  // [C, 4, 4], C <= 4
+    const at::Tensor &Ks,        // [C, 3, 3]
     int64_t image_width,
     int64_t image_height,
     double eps2d,
     double near_plane,
     double far_plane,
     double radius_clip,
-    bool antialiased
+    bool antialiased,
+    bool with_union
 );
 
 void launch_projection_ewa_3dgs_fused_fwd_kernel(
@@ -107,36 +112,26 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel(
     at::optional<at::Tensor> compensations // [..., C, N] optional
 );
 
-// Called twice: first with block_cnts to count survivors per block, then with
-// block_accum (their cumsum) and the output tensors to write them out.
-void launch_projection_ewa_3dgs_packed_fwd_kernel(
-    // inputs
-    const at::Tensor means,                   // [..., N, 3]
-    const at::optional<at::Tensor> covars,    // [..., N, 6] optional
-    const at::optional<at::Tensor> quats,     // [..., N, 4] optional
-    const at::optional<at::Tensor> scales,    // [..., N, 3] optional
-    const at::optional<at::Tensor> opacities, // [..., N] optional
-    const at::Tensor viewmats,                // [..., C, 4, 4]
-    const at::Tensor Ks,                      // [..., C, 3, 3]
+// Called twice: pass 1 fills block_cnts ([C + with_union, n_blocks] survivor
+// counts), pass 2 takes their per-row inclusive cumsums and writes `out`.
+void launch_projection_ewa_3dgs_packed_kernel(
+    const at::Tensor means,
+    const at::optional<at::Tensor> covars, // [N, 6] optional, else quats + scales
+    const at::Tensor quats,
+    const at::Tensor scales,
+    const at::Tensor opacities,
+    const at::Tensor viewmats,
+    const at::Tensor Ks,
     const uint32_t image_width,
     const uint32_t image_height,
     const float eps2d,
     const float near_plane,
     const float far_plane,
     const float radius_clip,
-    const at::optional<at::Tensor> block_accum, // [B * C * blocks_per_row]
-    const CameraModelType camera_model,
-    const bool antialiased, // cull on opacity * compensation (both passes)
-    // outputs
-    at::optional<at::Tensor> block_cnts,   // [B * C * blocks_per_row]
-    at::optional<at::Tensor> indptr,       // [B * C + 1]
-    at::optional<at::Tensor> batch_ids,    // [nnz]
-    at::optional<at::Tensor> camera_ids,   // [nnz]
-    at::optional<at::Tensor> gaussian_ids, // [nnz]
-    at::optional<at::Tensor> radii,        // [nnz, 2]
-    at::optional<at::Tensor> means2d,      // [nnz, 2]
-    at::optional<at::Tensor> depths,       // [nnz]
-    at::optional<at::Tensor> conics,       // [nnz, 3]
-    at::optional<at::Tensor> compensations // [nnz] optional
+    const bool antialiased,
+    const bool with_union,
+    at::optional<at::Tensor> block_cnts,
+    at::optional<at::Tensor> block_accum,
+    const ProjectionPackedResult *out
 );
 } // namespace gsplat

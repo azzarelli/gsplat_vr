@@ -121,27 +121,23 @@ ProjectionPackedResult projection_ewa_3dgs_packed(
     double near_plane,
     double far_plane,
     double radius_clip,
-    bool antialiased
+    bool antialiased,
+    bool with_union
 )
 {
     DEVICE_GUARD(means);
     check_projection_inputs(means, quats, scales, opacities, viewmats, Ks);
+    TORCH_CHECK(means.dim() == 2 && viewmats.dim() == 3, "packed projection takes means [N, 3] and viewmats [C, 4, 4]");
+    TORCH_CHECK(means.scalar_type() == at::kFloat, "packed projection is float32 only");
 
-    const uint32_t N = means.size(-2);
-    const uint32_t C = viewmats.size(-3);
-    const uint32_t B = c10::multiply_integers(means.sizes().slice(0, means.dim() - 2));
-    auto opt         = means.options();
-
-    const uint32_t blocks_per_row = (N + N_THREADS_PACKED - 1) / N_THREADS_PACKED;
-
-    // Pass 1: count survivors per block, then a cumsum gives each block its
-    // write offset. Reading the total back is a host sync.
-    int32_t nnz = 0;
-    at::Tensor block_accum;
-    if(B && C && N)
+    const int64_t N         = means.size(0);
+    const int64_t C         = viewmats.size(0);
+    const int64_t n_blocks  = (N + N_THREADS_PACKED - 1) / N_THREADS_PACKED;
+    const int64_t cam_cells = C * n_blocks;
+    auto opt                = means.options();
+    auto launch             = [&](at::optional<at::Tensor> cnts, at::optional<at::Tensor> accum, const ProjectionPackedResult *out)
     {
-        at::Tensor block_cnts = at::empty({B * C * blocks_per_row}, opt.dtype(at::kInt));
-        launch_projection_ewa_3dgs_packed_fwd_kernel(
+        launch_projection_ewa_3dgs_packed_kernel(
             means,
             c10::nullopt, // covars
             quats,
@@ -155,70 +151,54 @@ ProjectionPackedResult projection_ewa_3dgs_packed(
             near_plane,
             far_plane,
             radius_clip,
-            c10::nullopt, // block_accum
-            CameraModelType::PINHOLE,
             antialiased,
-            block_cnts,
-            c10::nullopt, // indptr
-            c10::nullopt, // batch_ids
-            c10::nullopt, // camera_ids
-            c10::nullopt, // gaussian_ids
-            c10::nullopt, // radii
-            c10::nullopt, // means2d
-            c10::nullopt, // depths
-            c10::nullopt, // conics
-            c10::nullopt  // compensations
+            with_union,
+            cnts,
+            accum,
+            out
         );
-        block_accum = at::cumsum(block_cnts, 0, at::kInt);
-        nnz         = block_accum[-1].item<int32_t>();
+    };
+
+    // Pass 1: survivors per (camera, block), plus a union row. Camera rows are
+    // cumsummed as one array (camera-major offsets), the union row on its own.
+    // Reading both totals back is one host sync.
+    int64_t nnz = 0, n_union = 0;
+    at::Tensor block_accum;
+    if(N)
+    {
+        at::Tensor block_cnts = at::empty({cam_cells + (with_union ? n_blocks : 0)}, opt.dtype(at::kInt));
+        launch(block_cnts, c10::nullopt, nullptr);
+        block_accum          = at::empty_like(block_cnts);
+        at::Tensor cam_accum = block_accum.narrow(0, 0, cam_cells);
+        at::cumsum_out(cam_accum, block_cnts.narrow(0, 0, cam_cells), 0, at::kInt);
+        at::Tensor totals = cam_accum.narrow(0, cam_cells - 1, 1);
+        if(with_union)
+        {
+            at::Tensor union_accum = block_accum.narrow(0, cam_cells, n_blocks);
+            at::cumsum_out(union_accum, block_cnts.narrow(0, cam_cells, n_blocks), 0, at::kInt);
+            totals = at::cat({totals, union_accum.narrow(0, n_blocks - 1, 1)});
+        }
+        const at::Tensor host = totals.cpu();
+        nnz                   = host[0].item<int32_t>();
+        n_union               = with_union ? host[1].item<int32_t>() : 0;
     }
 
     // Pass 2: recompute and write the survivors.
     ProjectionPackedResult out{
-        .batch_ids     = at::empty({nnz}, opt.dtype(at::kLong)),
-        .camera_ids    = at::empty({nnz}, opt.dtype(at::kLong)),
-        .gaussian_ids  = at::empty({nnz}, opt.dtype(at::kLong)),
-        .indptr        = at::empty({B * C + 1}, opt.dtype(at::kInt)),
-        .radii         = at::empty({nnz, 2}, opt.dtype(at::kInt)),
-        .means2d       = at::empty({nnz, 2}, opt),
-        .depths        = at::empty({nnz}, opt),
-        .conics        = at::empty({nnz, 3}, opt),
-        .compensations = antialiased ? at::empty({nnz}, opt) : at::Tensor(),
+        .batch_ids    = at::empty({nnz}, opt.dtype(at::kLong)),
+        .camera_ids   = at::empty({nnz}, opt.dtype(at::kLong)),
+        .gaussian_ids = at::empty({nnz}, opt.dtype(at::kLong)),
+        .radii        = at::empty({nnz, 2}, opt.dtype(at::kInt)),
+        .means2d      = at::empty({nnz, 2}, opt),
+        .depths       = at::empty({nnz}, opt),
+        .conics       = at::empty({nnz, 3}, opt),
+        .opacities    = at::empty({nnz}, opt),
+        .union_ids    = with_union ? at::empty({n_union}, opt.dtype(at::kLong)) : at::Tensor(),
+        .union_slots  = with_union ? at::empty({nnz}, opt.dtype(at::kLong)) : at::Tensor(),
     };
     if(nnz)
     {
-        launch_projection_ewa_3dgs_packed_fwd_kernel(
-            means,
-            c10::nullopt,
-            quats,
-            scales,
-            opacities,
-            viewmats,
-            Ks,
-            image_width,
-            image_height,
-            eps2d,
-            near_plane,
-            far_plane,
-            radius_clip,
-            block_accum,
-            CameraModelType::PINHOLE,
-            antialiased,
-            c10::nullopt,
-            out.indptr,
-            out.batch_ids,
-            out.camera_ids,
-            out.gaussian_ids,
-            out.radii,
-            out.means2d,
-            out.depths,
-            out.conics,
-            antialiased ? at::optional<at::Tensor>(out.compensations) : c10::nullopt
-        );
-    }
-    else
-    {
-        out.indptr.fill_(0);
+        launch(c10::nullopt, block_accum, &out);
     }
     return out;
 }

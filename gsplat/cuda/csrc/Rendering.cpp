@@ -143,8 +143,9 @@ namespace
         int64_t degree,
         const at::Tensor &coeffs,
         const at::Tensor &means,
-        const at::Tensor &viewmats,     // [C, 4, 4], C == 2
-        const at::Tensor &gaussian_ids, // [nnz]
+        const at::Tensor &viewmats,    // [C, 4, 4], C == 2
+        const at::Tensor &union_ids,   // [U] gaussians kept by either eye, from projection
+        const at::Tensor &union_slots, // [nnz] each entry's index in union_ids
         const at::optional<at::Tensor> &depths
     )
     {
@@ -161,21 +162,7 @@ namespace
             .select(2, 3)
             .copy_(-at::matmul(rot.select(0, 0), c_mid.unsqueeze(-1)).squeeze(-1).unsqueeze(0));
 
-        // Union of the two eyes' survivors, and the map from each packed entry
-        // into it. The packed projection emits gaussian ids ascending within
-        // each camera, so the list is two sorted runs and a general sort is
-        // wasted work -- a presence mask over N gives the same union (nonzero
-        // returns ascending indices) about three times faster.
-        const int64_t n_gaussians = means.size(-2);
-        at::Tensor seen           = at::zeros({n_gaussians}, gaussian_ids.options().dtype(at::kBool));
-        seen.index_put_({gaussian_ids}, at::ones({}, seen.options()));
-        at::Tensor uniq = seen.nonzero().squeeze(-1);
-
-        at::Tensor slot = at::empty({n_gaussians}, gaussian_ids.options());
-        slot.index_put_({uniq}, at::arange(uniq.size(0), slot.options()));
-        at::Tensor inverse = slot.index({gaussian_ids});
-
-        at::Tensor zeros_u = at::zeros_like(uniq);
+        at::Tensor zeros_u = at::zeros_like(union_ids);
         at::Tensor values  = spherical_harmonics(
             degree,
             means,
@@ -184,9 +171,9 @@ namespace
             c10::nullopt,
             zeros_u, // batch_ids  (B == 1 on this path)
             zeros_u, // camera_ids (the single cyclopean camera)
-            uniq
+            union_ids
         );
-        return packed_features(values, inverse, depths);
+        return packed_features(values, union_slots, depths);
     }
 
     // Already-activated colours ([N, D] or [C, N, D]) in the layout the
@@ -256,11 +243,14 @@ RasterizationOutputs rasterization_3dgs(
 
     // --- 1. Project ----------------------------------------------------------
     at::Tensor batch_ids, camera_ids, gaussian_ids, radii, means2d, depths, conics, proj_opacities;
+    at::Tensor union_ids, union_slots; // shared-eye colour only
+    const bool shared_sh = packed && stereo && C == 2 && colors.has_value() && sh_degree >= 0;
     if(packed)
     {
         ProjectionPackedResult p = projection_ewa_3dgs_packed(
             means, quats, scales, opacities, viewmats, Ks, image_width, image_height, eps2d, near_plane, far_plane, radius_clip,
-            antialiased
+            antialiased,
+            shared_sh
         );
         batch_ids      = p.batch_ids; // all 0: one scene, no batch dims
         camera_ids     = p.camera_ids;
@@ -269,11 +259,9 @@ RasterizationOutputs rasterization_3dgs(
         means2d        = p.means2d;
         depths         = p.depths;
         conics         = p.conics;
-        proj_opacities = opacities.index({gaussian_ids});
-        if(antialiased)
-        {
-            proj_opacities.mul_(p.compensations);
-        }
+        proj_opacities = p.opacities;
+        union_ids      = p.union_ids;
+        union_slots    = p.union_slots;
     }
     else
     {
@@ -314,8 +302,10 @@ RasterizationOutputs rasterization_3dgs(
         else
         {
             const at::optional<at::Tensor> depth_channel = append_depth ? at::optional<at::Tensor>(depths) : c10::nullopt;
-            features = stereo && C == 2
-                         ? evaluate_feature_sh_stereo_shared(sh_degree, colors.value(), means, viewmats, gaussian_ids, depth_channel)
+            features = shared_sh
+                         ? evaluate_feature_sh_stereo_shared(
+                               sh_degree, colors.value(), means, viewmats, union_ids, union_slots, depth_channel
+                           )
                          : evaluate_sh_packed(
                                sh_degree, colors.value(), means, viewmats, valid, batch_ids, camera_ids, gaussian_ids, depth_channel
                            );
