@@ -27,8 +27,10 @@ namespace gsplat
 // (render_colors, render_alphas,
 //  camera_ids, gaussian_ids,                   -- packed only, else undefined
 //  radii, means2d, depths, conics, opacities,  -- projected gaussians
-//  tiles_per_gauss, isect_ids, flatten_ids, isect_offsets)
+//  tiles_per_gauss, isect_ids, flatten_ids, isect_offsets,
+//  stage_ms)                                   -- [6] CPU float32 if profile, else empty
 using RasterizationOutputs = std::tuple<
+    at::Tensor,
     at::Tensor,
     at::Tensor,
     at::Tensor,
@@ -66,6 +68,7 @@ RasterizationOutputs rasterization_3dgs(
     bool expected_depth,
     bool packed,
     bool segmented,
-    bool stereo
+    bool stereo,
+    bool profile
 );
 } // namespace gsplat

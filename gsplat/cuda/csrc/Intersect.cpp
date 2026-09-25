@@ -23,6 +23,7 @@
 #include "Common.h"
 #include "Intersect.h"
 #include "MathUtils.h"
+#include "StageTimer.h"
 
 namespace gsplat
 {
@@ -38,7 +39,8 @@ TileIntersectResult intersect_tile(
     int64_t tile_size,
     int64_t tile_width,
     int64_t tile_height,
-    bool segmented
+    bool segmented,
+    StageTimer *timer
 )
 {
     DEVICE_GUARD(means2d);
@@ -96,6 +98,10 @@ TileIntersectResult intersect_tile(
     at::Tensor flatten_ids = at::empty({n_isects}, opt.dtype(at::kInt));
     if(n_isects == 0)
     {
+        if(timer)
+        {
+            timer->mark();
+        }
         return {.tiles_per_gauss = tiles_per_gauss, .isect_ids = isect_ids, .flatten_ids = flatten_ids};
     }
     launch_intersect_tile_kernel(
@@ -115,6 +121,10 @@ TileIntersectResult intersect_tile(
         isect_ids,
         flatten_ids
     );
+    if(timer)
+    {
+        timer->mark();
+    }
 
     // Sort by key: image, tile, then depth.
     at::Tensor isect_ids_sorted   = at::empty_like(isect_ids);

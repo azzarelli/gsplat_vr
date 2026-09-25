@@ -21,6 +21,8 @@ from torch import Tensor
 RenderMode = Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"]
 _COLOR_MODES = ("RGB", "RGB+D", "RGB+ED")
 _RENDER_MODES = ("RGB", "D", "ED", "RGB+D", "RGB+ED")
+# Order of the CUDA-event stages in Rendering.cpp.
+_STAGES = ("project", "sh", "isect", "sort", "blend", "ed")
 
 
 def rasterization(
@@ -44,6 +46,7 @@ def rasterization(
     render_mode: RenderMode = "RGB",
     segmented: bool = False,
     stereo: bool = False,
+    profile: bool = False,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Render C views of N Gaussians. Forward only.
 
@@ -57,6 +60,7 @@ def rasterization(
         kernel and allows `segmented` (per-image) sorting.
     stereo: packed with C == 2 only. Evaluates SH once per gaussian from the
         midpoint of the two cameras and shares it between the eyes.
+    profile: time each stage with CUDA events into meta["stage_ms"] (syncs).
     radius_clip: cull gaussians whose projected radius is at most this (px).
     eps2d: added to the 2D covariance diagonal (low-pass filter).
     tile_size: 16, or 4.
@@ -83,6 +87,7 @@ def rasterization(
         isect_ids,
         flatten_ids,
         isect_offsets,
+        stage_ms,
     ) = _C.rasterization_3dgs(
         means.contiguous(),
         quats.contiguous(),
@@ -105,6 +110,7 @@ def rasterization(
         packed,
         segmented,
         stereo,
+        profile,
     )
 
     meta = {
@@ -125,5 +131,6 @@ def rasterization(
         "width": width,
         "height": height,
         "n_cameras": viewmats.shape[0],
+        "stage_ms": dict(zip(_STAGES, stage_ms.tolist())),
     }
     return render_colors, render_alphas, meta

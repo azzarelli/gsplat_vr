@@ -23,6 +23,8 @@
 
 namespace gsplat
 {
+class StageTimer;
+
 // One entry per (gaussian, tile) overlap. isect_ids packs
 // [image id | tile id | depth bits] so a single radix sort orders entries by
 // image, then tile, then front-to-back; flatten_ids points each entry back at
@@ -38,6 +40,7 @@ struct TileIntersectResult
 // n_images; dense inputs are [I, N, ...]. conics + opacities enable the tight
 // (AccuTile) tile test, otherwise the radius AABB is used. `segmented` sorts
 // each image separately (dense only). Costs a host sync to learn n_isects.
+// `timer`, if given, is marked between emitting the pairs and sorting them.
 TileIntersectResult intersect_tile(
     const at::Tensor &means2d,
     const at::Tensor &radii,
@@ -50,7 +53,8 @@ TileIntersectResult intersect_tile(
     int64_t tile_size,
     int64_t tile_width,
     int64_t tile_height,
-    bool segmented
+    bool segmented,
+    StageTimer *timer = nullptr
 );
 
 // First entry of each (image, tile) in the sorted isect_ids: [I, tile_height, tile_width].

@@ -27,6 +27,8 @@
 //   5. ED           divide accumulated depth by alpha
 //
 // Stages 1 and 3 each read a count back to the host (nnz, n_isects).
+// With `profile`, CUDA events split this into project | sh | isect | sort |
+// blend | ed (the order _STAGES in gsplat/rendering.py expects).
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -38,6 +40,7 @@
 #include "Rasterization.h"
 #include "Rendering.h"
 #include "SphericalHarmonics.h"
+#include "StageTimer.h"
 
 namespace gsplat
 {
@@ -233,7 +236,8 @@ RasterizationOutputs rasterization_3dgs(
     bool expected_depth,
     bool packed,
     bool segmented,
-    bool stereo
+    bool stereo,
+    bool profile
 )
 {
     DEVICE_GUARD(means);
@@ -254,6 +258,7 @@ RasterizationOutputs rasterization_3dgs(
     );
     const int64_t N = means.size(0);
     const int64_t C = viewmats.size(0);
+    StageTimer timer(profile);
 
     // --- 1. Project ----------------------------------------------------------
     at::Tensor batch_ids, camera_ids, gaussian_ids, radii, means2d, depths, conics, proj_opacities;
@@ -283,6 +288,7 @@ RasterizationOutputs rasterization_3dgs(
         proj_opacities = opacities.unsqueeze(0).expand({C, N});
     }
     const at::Tensor valid = radii.gt(0).all(-1); // culled entries have zero radius
+    timer.mark();
 
     // --- 2. Colour (+ depth channel) -----------------------------------------
     at::Tensor features;
@@ -334,6 +340,7 @@ RasterizationOutputs rasterization_3dgs(
                                                       : at::zeros({C, 1}, bg.options());
         }
     }
+    timer.mark();
 
     // --- 3. Tile intersection + sort -----------------------------------------
     const int64_t tile_width  = static_cast<int64_t>(std::ceil(image_width / static_cast<double>(tile_size)));
@@ -354,9 +361,11 @@ RasterizationOutputs rasterization_3dgs(
         tile_size,
         tile_width,
         tile_height,
-        segmented
+        segmented,
+        &timer
     );
     at::Tensor isect_offsets = intersect_offset(isects.isect_ids, C, tile_width, tile_height);
+    timer.mark();
 
     // --- 4. Rasterize --------------------------------------------------------
     RasterizeResult raster = rasterize_to_pixels_3dgs(
@@ -372,6 +381,7 @@ RasterizationOutputs rasterization_3dgs(
         isects.flatten_ids
     );
     at::Tensor render_colors = raster.renders;
+    timer.mark();
 
     // --- 5. Expected depth ---------------------------------------------------
     if(expected_depth)
@@ -380,6 +390,7 @@ RasterizationOutputs rasterization_3dgs(
         at::Tensor depth = render_colors.slice(-1, d, d + 1) / raster.alphas.clamp_min(1e-10);
         render_colors    = at::cat({render_colors.slice(-1, 0, d), depth}, -1);
     }
+    timer.mark();
 
     return {
         render_colors,
@@ -395,6 +406,7 @@ RasterizationOutputs rasterization_3dgs(
         isects.isect_ids,
         isects.flatten_ids,
         isect_offsets,
+        timer.elapsed_ms(),
     };
 }
 } // namespace gsplat
