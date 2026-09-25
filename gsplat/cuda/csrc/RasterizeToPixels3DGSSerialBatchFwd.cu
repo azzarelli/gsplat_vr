@@ -21,6 +21,7 @@
 #include <ATen/Dispatch.h>
 #include <ATen/core/Tensor.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cstdlib>
 
 #include "Common.h"
 #include "Dispatch.h"
@@ -412,7 +413,24 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         // pressure scale with CDIM alone; it is parity at CDIM=3 (see issue #8).
         if(tile_size == 16)
         {
-            launch_variant.template operator()<16, 256>();
+            // TEMPORARY, for profiling: GSPLAT_PIXELS_PER_THREAD=2|4 picks CTA=128|64.
+            static const int ppt = []
+            {
+                const char *v = std::getenv("GSPLAT_PIXELS_PER_THREAD");
+                return v ? std::atoi(v) : 1;
+            }();
+            if(ppt == 4)
+            {
+                launch_variant.template operator()<16, 64>();
+            }
+            else if(ppt == 2)
+            {
+                launch_variant.template operator()<16, 128>();
+            }
+            else
+            {
+                launch_variant.template operator()<16, 256>();
+            }
         }
         else if(tile_size == 4)
         {
