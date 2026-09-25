@@ -39,6 +39,8 @@ TileIntersectResult intersect_tile(
     int64_t tile_size,
     int64_t tile_width,
     int64_t tile_height,
+    double near_plane,
+    double far_plane,
     StageTimer *timer
 )
 {
@@ -51,11 +53,15 @@ TileIntersectResult intersect_tile(
     const int64_t I            = n_images;
     const uint32_t n_elements  = means2d.numel() / 2;
     const uint32_t n_tiles     = tile_width * tile_height;
-    const uint32_t image_bits  = bits_for_count(I);
-    const uint32_t tile_bits   = bits_for_count(n_tiles);
+    const KeyLayout layout     = key_layout(I, n_tiles);
     auto opt                   = depths.options();
     TORCH_CHECK(!packed || (image_ids.has_value() && gaussian_ids.has_value()), "packed inputs need image/gaussian ids");
-    TORCH_CHECK(image_bits + tile_bits <= 32, "(image, tile) id needs ", image_bits + tile_bits, " bits, only 32 fit");
+    TORCH_CHECK(
+        layout.image_bits + layout.tile_bits <= 32,
+        "(image, tile) id needs ",
+        layout.image_bits + layout.tile_bits,
+        " bits, only 32 fit"
+    );
 
     // Pass 1: tiles touched per gaussian; its cumsum is each gaussian's write
     // offset. Reading the total back is a host sync.
@@ -76,6 +82,8 @@ TileIntersectResult intersect_tile(
             tile_size,
             tile_width,
             tile_height,
+            near_plane,
+            far_plane,
             c10::nullopt, // cum_tiles_per_gauss
             tiles_per_gauss,
             c10::nullopt, // isect_ids
@@ -86,7 +94,7 @@ TileIntersectResult intersect_tile(
     }
 
     // Pass 2: write the (key, gaussian) pairs.
-    at::Tensor isect_ids   = at::empty({n_isects}, opt.dtype(at::kLong));
+    at::Tensor isect_ids   = at::empty({n_isects}, opt.dtype(layout.compact ? at::kInt : at::kLong));
     at::Tensor flatten_ids = at::empty({n_isects}, opt.dtype(at::kInt));
     if(n_isects == 0)
     {
@@ -108,6 +116,8 @@ TileIntersectResult intersect_tile(
         tile_size,
         tile_width,
         tile_height,
+        near_plane,
+        far_plane,
         cum_tiles_per_gauss,
         c10::nullopt, // tiles_per_gauss
         isect_ids,
@@ -121,9 +131,7 @@ TileIntersectResult intersect_tile(
     // Sort by key: image, tile, then depth.
     at::Tensor isect_ids_sorted   = at::empty_like(isect_ids);
     at::Tensor flatten_ids_sorted = at::empty_like(flatten_ids);
-    radix_sort_double_buffer(
-        n_isects, image_bits, tile_bits, isect_ids, flatten_ids, isect_ids_sorted, flatten_ids_sorted
-    );
+    radix_sort_double_buffer(n_isects, layout, isect_ids, flatten_ids, isect_ids_sorted, flatten_ids_sorted);
     return {.isect_ids = isect_ids_sorted, .flatten_ids = flatten_ids_sorted};
 }
 

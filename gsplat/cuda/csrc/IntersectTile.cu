@@ -20,9 +20,11 @@
 #include <ATen/core/Tensor.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cassert>
+#include <cmath>
 #include <cooperative_groups.h>
 #include <cuda/std/functional>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 // for CUB_WRAPPER
@@ -48,6 +50,22 @@ namespace cg = cooperative_groups;
         C10_CUDA_CHECK(func(temp_storage, temp_storage_bytes, __VA_ARGS__, stream)); \
         C10_CUDA_CHECK(cudaFreeAsync(temp_storage, stream));                         \
     } while(false)
+
+// Key buffer as KeyT: compact keys are uint32 stored in an int32 tensor.
+template<typename KeyT>
+KeyT *key_data(const at::Tensor &keys)
+{
+    if constexpr(std::is_same_v<KeyT, uint32_t>)
+    {
+        TORCH_CHECK(keys.scalar_type() == at::kInt, "compact keys must be int32");
+        return reinterpret_cast<uint32_t *>(keys.data_ptr<int32_t>());
+    }
+    else
+    {
+        TORCH_CHECK(keys.scalar_type() == at::kLong, "wide keys must be int64");
+        return keys.data_ptr<int64_t>();
+    }
+}
 
 struct TileColumnRange
 {
@@ -93,6 +111,7 @@ inline __device__ float2
     return {(-B * h - sqrt_term) / coeff + p_v, (-B * h + sqrt_term) / coeff + p_v};
 }
 
+template<typename KeyT>
 inline __device__ uint32_t accutile_process_tiles(
     float A,
     float B,
@@ -113,11 +132,11 @@ inline __device__ uint32_t accutile_process_tiles(
     int64_t image_id,
     int64_t key_start,
     int64_t key_end,
-    int64_t iid_enc,
-    uint32_t tile_n_bits,
-    int64_t depth_id_enc,
+    KeyT iid_enc,
+    uint32_t depth_bits,
+    KeyT depth_enc,
     uint32_t flatten_idx,
-    int64_t *isect_ids,
+    KeyT *isect_ids,
     int32_t *flatten_ids,
     int64_t *cur_idx
 )
@@ -194,7 +213,7 @@ inline __device__ uint32_t accutile_process_tiles(
 
             if(isect_ids != nullptr)
             {
-                isect_ids[*cur_idx]   = iid_enc | (tile_id << 32) | depth_id_enc;
+                isect_ids[*cur_idx]   = iid_enc | static_cast<KeyT>(static_cast<uint64_t>(tile_id) << depth_bits) | depth_enc;
                 flatten_ids[*cur_idx] = static_cast<int32_t>(flatten_idx);
                 ++(*cur_idx);
             }
@@ -210,7 +229,7 @@ inline __device__ uint32_t accutile_process_tiles(
 // Main intersection kernel
 // ============================================================
 
-template<typename scalar_t>
+template<typename scalar_t, typename KeyT>
 __global__ void intersect_tile_kernel(
     const int64_t offset,
     const int64_t count,
@@ -233,13 +252,16 @@ __global__ void intersect_tile_kernel(
     const uint32_t tile_size,
     const uint32_t tile_width,
     const uint32_t tile_height,
-    const uint32_t tile_n_bits,
-    const uint32_t image_n_bits,
+    const uint32_t tile_bits,
+    const uint32_t depth_bits,
+    const float log_near,    // compact keys: depth code = (log(depth) - log_near) * depth_scale
+    const float depth_scale, // clamped to [0, max_code]
+    const float max_code,
     const int64_t key_start,
     const int64_t key_end,
     const bool *__restrict__ tile_mask,    // [I, tile_height, tile_width] optional
     int32_t *__restrict__ tiles_per_gauss, // [..., N] or [nnz]
-    int64_t *__restrict__ isect_ids,       // [n_isects]
+    KeyT *__restrict__ isect_ids,          // [n_isects]
     int32_t *__restrict__ flatten_ids      // [n_isects]
 )
 {
@@ -266,23 +288,28 @@ __global__ void intersect_tile_kernel(
     float2 mean2d = {(float)means2d[2 * idx], (float)means2d[2 * idx + 1]};
 
     int64_t iid          = packed ? image_ids[idx] : idx / N;
-    int64_t iid_enc      = 0;
-    int64_t depth_id_enc = 0;
+    KeyT iid_enc   = 0;
+    KeyT depth_enc = 0;
     if(!first_pass)
     {
-        iid_enc = iid << (32 + tile_n_bits);
+        // 64-bit shifts: a field can be 32 bits wide in a compact key
+        iid_enc = static_cast<KeyT>(static_cast<uint64_t>(iid) << (tile_bits + depth_bits));
 
-        // Narrow to float so the 32-bit key is a monotonic depth ordering for
-        // any scalar_t (a bare 32-bit reinterpret of a double would read only
-        // half its bits). Monotonic for the non-negative depths that reach
-        // here after near-plane culling; the sign bit would invert ordering.
-        float depth_f = static_cast<float>(depths[idx]);
-        // The float-bit key is monotonic only for non-negative depths: a set
-        // sign bit would invert the unsigned ordering. isect_tiles is a
-        // standalone op, so pin the invariant the comment relies on.
-        assert(depth_f >= 0.f);
-        // Bit-level reinterpret, zero-extended into the low 32 bits of the key.
-        depth_id_enc = __float_as_uint(depth_f);
+        // Narrow to float so the key is a monotonic depth ordering for any
+        // scalar_t (a bare 32-bit reinterpret of a double would read only half
+        // its bits).
+        const float depth_f = static_cast<float>(depths[idx]);
+        if constexpr(std::is_same_v<KeyT, uint32_t>)
+        {
+            depth_enc = static_cast<uint32_t>(fminf(fmaxf((__logf(depth_f) - log_near) * depth_scale, 0.f), max_code));
+        }
+        else
+        {
+            // The float bits order like the value only for non-negative depths,
+            // which near-plane culling guarantees.
+            assert(depth_f >= 0.f);
+            depth_enc = __float_as_uint(depth_f);
+        }
     }
 
     if(conics != nullptr && opacities != nullptr)
@@ -358,8 +385,8 @@ __global__ void intersect_tile_kernel(
             key_start,
             key_end,
             iid_enc,
-            tile_n_bits,
-            depth_id_enc,
+            depth_bits,
+            depth_enc,
             idx,
             first_pass ? nullptr : isect_ids,
             first_pass ? nullptr : flatten_ids,
@@ -452,9 +479,7 @@ __global__ void intersect_tile_kernel(
                     continue;
                 }
                 int64_t tile_id      = i * tile_width + j;
-                // e.g. tile_n_bits = 22:
-                // image id (10 bits) | tile id (22 bits) | depth (32 bits)
-                isect_ids[cur_idx]   = iid_enc | (tile_id << 32) | depth_id_enc;
+                isect_ids[cur_idx]   = iid_enc | static_cast<KeyT>(static_cast<uint64_t>(tile_id) << depth_bits) | depth_enc;
                 // the flatten index in [I * N] or [nnz]
                 flatten_ids[cur_idx] = static_cast<int32_t>(idx);
                 ++cur_idx;
@@ -476,6 +501,8 @@ void launch_intersect_tile_kernel(
     const uint32_t tile_size,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const float near_plane,
+    const float far_plane,
     const at::optional<at::Tensor> cum_tiles_per_gauss, // [..., N] or [nnz]
     // outputs
     at::optional<at::Tensor> tiles_per_gauss, // [..., N] or [nnz]
@@ -501,25 +528,27 @@ void launch_intersect_tile_kernel(
         n_elements = I * N;
     }
 
-    const uint32_t n_tiles      = tile_width * tile_height;
-    // the number of bits needed to encode the image id and tile id; must match
-    // the packing in intersect_tile so the (image, tile) id unpacks correctly.
-    const uint32_t image_n_bits = bits_for_count(I);
-    const uint32_t tile_n_bits  = bits_for_count(n_tiles);
-    const int64_t key_start     = 0;
-    const int64_t key_end       = static_cast<int64_t>(I) * n_tiles;
-    // the first 32 bits are used for the image id and tile id altogether, so
-    // check if we have enough bits for them.
+    const uint32_t n_tiles  = tile_width * tile_height;
+    const KeyLayout layout  = key_layout(I, n_tiles);
+    const int64_t key_start = 0;
+    const int64_t key_end   = static_cast<int64_t>(I) * n_tiles;
     TORCH_CHECK(
-        image_n_bits + tile_n_bits <= 32,
+        layout.image_bits + layout.tile_bits <= 32,
         "intersect_tile: (image, tile) id packing needs ",
-        image_n_bits + tile_n_bits,
+        layout.image_bits + layout.tile_bits,
         " bits but only 32 are available (I=",
         I,
         ", n_tiles=",
         n_tiles,
         ")."
     );
+
+    // Compact keys map log-depth over [near, far] onto [0, max_code].
+    const float near_clamped = std::max(near_plane, 1e-6f);
+    TORCH_CHECK(far_plane > near_clamped, "intersect_tile: far_plane must exceed near_plane");
+    const float log_near    = std::log(near_clamped);
+    const float max_code    = static_cast<float>((uint64_t{1} << layout.depth_bits) - 1);
+    const float depth_scale = max_code / (std::log(far_plane) - log_near);
 
     constexpr unsigned int threads = 256;
     unsigned int blocks            = static_cast<unsigned int>(::cuda::ceil_div<int64_t>(n_elements, threads));
@@ -531,51 +560,67 @@ void launch_intersect_tile_kernel(
     }
 
     auto stream = at::cuda::getCurrentCUDAStream();
-    AT_DISPATCH_FLOATING_TYPES(
-        means2d.scalar_type(),
-        "intersect_tile_kernel",
-        [&]()
-        {
-            intersect_tile_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
-                0,
-                n_elements,
-                packed,
-                I,
-                N,
-                nnz,
-                image_ids.has_value() ? image_ids.value().const_data_ptr<int64_t>() : nullptr,
-                gaussian_ids.has_value() ? gaussian_ids.value().const_data_ptr<int64_t>() : nullptr,
-                means2d.const_data_ptr<scalar_t>(),
-                radii.const_data_ptr<int32_t>(),
-                depths.const_data_ptr<scalar_t>(),
-                conics.has_value() ? conics.value().const_data_ptr<float>() : nullptr,
-                opacities.has_value() ? opacities.value().const_data_ptr<float>() : nullptr,
-                cum_tiles_per_gauss.has_value() ? cum_tiles_per_gauss.value().const_data_ptr<int64_t>() : nullptr,
-                tile_size,
-                tile_width,
-                tile_height,
-                tile_n_bits,
-                image_n_bits,
-                key_start,
-                key_end,
-                tile_mask.has_value() ? tile_mask.value().const_data_ptr<bool>() : nullptr,
-                tiles_per_gauss.has_value() ? tiles_per_gauss.value().data_ptr<int32_t>() : nullptr,
-                isect_ids.has_value() ? isect_ids.value().data_ptr<int64_t>() : nullptr,
-                flatten_ids.has_value() ? flatten_ids.value().data_ptr<int32_t>() : nullptr
-            );
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
-        }
-    );
+    auto launch = [&]<typename KeyT>()
+    {
+        AT_DISPATCH_FLOATING_TYPES(
+            means2d.scalar_type(),
+            "intersect_tile_kernel",
+            [&]()
+            {
+                intersect_tile_kernel<scalar_t, KeyT><<<blocks, threads, 0, stream>>>(
+                    0,
+                    n_elements,
+                    packed,
+                    I,
+                    N,
+                    nnz,
+                    image_ids.has_value() ? image_ids.value().const_data_ptr<int64_t>() : nullptr,
+                    gaussian_ids.has_value() ? gaussian_ids.value().const_data_ptr<int64_t>() : nullptr,
+                    means2d.const_data_ptr<scalar_t>(),
+                    radii.const_data_ptr<int32_t>(),
+                    depths.const_data_ptr<scalar_t>(),
+                    conics.has_value() ? conics.value().const_data_ptr<float>() : nullptr,
+                    opacities.has_value() ? opacities.value().const_data_ptr<float>() : nullptr,
+                    cum_tiles_per_gauss.has_value() ? cum_tiles_per_gauss.value().const_data_ptr<int64_t>() : nullptr,
+                    tile_size,
+                    tile_width,
+                    tile_height,
+                    layout.tile_bits,
+                    layout.depth_bits,
+                    log_near,
+                    depth_scale,
+                    max_code,
+                    key_start,
+                    key_end,
+                    tile_mask.has_value() ? tile_mask.value().const_data_ptr<bool>() : nullptr,
+                    tiles_per_gauss.has_value() ? tiles_per_gauss.value().data_ptr<int32_t>() : nullptr,
+                    isect_ids.has_value() ? key_data<KeyT>(isect_ids.value()) : nullptr,
+                    flatten_ids.has_value() ? flatten_ids.value().data_ptr<int32_t>() : nullptr
+                );
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+            }
+        );
+    };
+    if(layout.compact)
+    {
+        launch.template operator()<uint32_t>();
+    }
+    else
+    {
+        launch.template operator()<int64_t>();
+    }
 }
 
+template<typename KeyT>
 __global__ void intersect_offset_kernel(
     const int64_t offset,
     const int64_t count,
     const int64_t n_isects,
-    const int64_t *__restrict__ isect_ids,
+    const KeyT *__restrict__ isect_ids,
     const uint32_t I,
     const uint32_t n_tiles,
-    const uint32_t tile_n_bits,
+    const uint32_t tile_bits,
+    const uint32_t depth_bits,
     int64_t *__restrict__ offsets // [I, n_tiles]
 )
 {
@@ -590,9 +635,10 @@ __global__ void intersect_offset_kernel(
     }
     const int64_t idx = local_idx + offset;
 
-    int64_t isect_id_curr = isect_ids[idx] >> 32;
-    int64_t iid_curr      = isect_id_curr >> (tile_n_bits);
-    int64_t tid_curr      = isect_id_curr & ((uint64_t{1} << tile_n_bits) - 1);
+    // shift out the depth, leaving (image, tile)
+    int64_t isect_id_curr = static_cast<int64_t>(static_cast<uint64_t>(isect_ids[idx]) >> depth_bits);
+    int64_t iid_curr      = isect_id_curr >> tile_bits;
+    int64_t tid_curr      = isect_id_curr & ((int64_t{1} << tile_bits) - 1);
     int64_t id_curr       = iid_curr * n_tiles + tid_curr;
 
     if(idx == 0)
@@ -614,17 +660,17 @@ __global__ void intersect_offset_kernel(
 
     if(idx > 0)
     {
-        // visit the current and previous isect_id and check if the (bid, cid,
-        // tile_id) tuple changes.
-        int64_t isect_id_prev = isect_ids[idx - 1] >> 32; // shift out the depth
+        // visit the current and previous isect_id and check if the (image,
+        // tile) pair changes.
+        int64_t isect_id_prev = static_cast<int64_t>(static_cast<uint64_t>(isect_ids[idx - 1]) >> depth_bits);
         if(isect_id_prev == isect_id_curr)
         {
             return;
         }
 
         // write out the offsets between the previous and current tiles
-        int64_t iid_prev = isect_id_prev >> (tile_n_bits);
-        int64_t tid_prev = isect_id_prev & ((uint64_t{1} << tile_n_bits) - 1);
+        int64_t iid_prev = isect_id_prev >> tile_bits;
+        int64_t tid_prev = isect_id_prev & ((int64_t{1} << tile_bits) - 1);
         int64_t id_prev  = iid_prev * n_tiles + tid_prev;
         for(int64_t i = id_prev + 1; i < id_curr + 1; ++i)
         {
@@ -653,30 +699,40 @@ void launch_intersect_offset_kernel(
         return;
     }
 
-    const uint32_t n_tiles     = tile_width * tile_height;
-    // Must match the packing in launch_intersect_tile_kernel so the (image,
-    // tile) id unpacks with the same field width it was packed with.
-    const uint32_t tile_n_bits = bits_for_count(n_tiles);
-    auto stream                = at::cuda::getCurrentCUDAStream();
-    intersect_offset_kernel<<<blocks, threads, 0, stream>>>(
-        0,
-        n_elements,
-        n_elements,
-        isect_ids.const_data_ptr<int64_t>(),
-        I,
-        n_tiles,
-        tile_n_bits,
-        offsets.data_ptr<int64_t>()
-    );
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    const uint32_t n_tiles = tile_width * tile_height;
+    // Same layout as launch_intersect_tile_kernel packed with.
+    const KeyLayout layout = key_layout(I, n_tiles);
+    auto stream            = at::cuda::getCurrentCUDAStream();
+    auto launch            = [&]<typename KeyT>()
+    {
+        intersect_offset_kernel<KeyT><<<blocks, threads, 0, stream>>>(
+            0,
+            n_elements,
+            n_elements,
+            key_data<KeyT>(isect_ids),
+            I,
+            n_tiles,
+            layout.tile_bits,
+            layout.depth_bits,
+            offsets.data_ptr<int64_t>()
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    };
+    if(layout.compact)
+    {
+        launch.template operator()<uint32_t>();
+    }
+    else
+    {
+        launch.template operator()<int64_t>();
+    }
 }
 
 // https://nvidia.github.io/cccl/cub/api/structcub_1_1DeviceRadixSort.html
 // DoubleBuffer reduce the auxiliary memory usage from O(N+P) to O(P)
 void radix_sort_double_buffer(
     const int64_t n_isects,
-    const uint32_t image_n_bits,
-    const uint32_t tile_n_bits,
+    const KeyLayout &layout,
     at::Tensor isect_ids,
     at::Tensor flatten_ids,
     at::Tensor isect_ids_sorted,
@@ -688,33 +744,32 @@ void radix_sort_double_buffer(
         return;
     }
 
-    // Create a set of DoubleBuffers to wrap pairs of device pointers
-    cub::DoubleBuffer<int64_t> d_keys(isect_ids.data_ptr<int64_t>(), isect_ids_sorted.data_ptr<int64_t>());
-    cub::DoubleBuffer<int32_t> d_values(flatten_ids.data_ptr<int32_t>(), flatten_ids_sorted.data_ptr<int32_t>());
-    CUB_WRAPPER(
-        cub::DeviceRadixSort::SortPairs,
-        d_keys,
-        d_values,
-        n_isects,
-        0,
-        32 + tile_n_bits + image_n_bits,
-        at::cuda::getCurrentCUDAStream()
-    );
-    switch(d_keys.selector)
+    // Returns which buffer (0: input, 1: *_sorted) holds the sorted keys and values.
+    auto sort = [&]<typename KeyT>()
     {
-    case 0: // sorted items are stored in isect_ids
+        cub::DoubleBuffer<KeyT> d_keys(key_data<KeyT>(isect_ids), key_data<KeyT>(isect_ids_sorted));
+        cub::DoubleBuffer<int32_t> d_values(flatten_ids.data_ptr<int32_t>(), flatten_ids_sorted.data_ptr<int32_t>());
+        CUB_WRAPPER(
+            cub::DeviceRadixSort::SortPairs,
+            d_keys,
+            d_values,
+            n_isects,
+            0,
+            layout.image_bits + layout.tile_bits + layout.depth_bits,
+            at::cuda::getCurrentCUDAStream()
+        );
+        return std::make_pair(d_keys.selector, d_values.selector);
+    };
+    const auto [key_selector, value_selector]
+        = layout.compact ? sort.template operator()<uint32_t>() : sort.template operator()<int64_t>();
+
+    if(key_selector == 0) // sorted keys are in isect_ids
+    {
         isect_ids_sorted.set_(isect_ids);
-        break;
-    case 1: // sorted items are stored in isect_ids_sorted
-        break;
     }
-    switch(d_values.selector)
+    if(value_selector == 0) // sorted values are in flatten_ids
     {
-    case 0: // sorted items are stored in flatten_ids
         flatten_ids_sorted.set_(flatten_ids);
-        break;
-    case 1: // sorted items are stored in flatten_ids_sorted
-        break;
     }
 }
 } // namespace gsplat

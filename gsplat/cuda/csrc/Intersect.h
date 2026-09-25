@@ -19,19 +19,44 @@
 #pragma once
 
 #include <ATen/core/Tensor.h>
+#include <algorithm>
 #include <cstdint>
+
+#include "MathUtils.h"
 
 namespace gsplat
 {
 class StageTimer;
 
-// One entry per (gaussian, tile) overlap. isect_ids packs
-// [image id | tile id | depth bits] so a single radix sort orders entries by
-// image, then tile, then front-to-back; flatten_ids points each entry back at
-// its gaussian row (dense: image * N + gaussian, packed: the packed row).
+// isect_ids pack [image | tile | depth] so a single radix sort orders entries
+// by image, then tile, then front-to-back. If the image and tile ids leave at
+// least kMinDepthBits of a 32-bit key, keys are compact: 32 bits, with
+// log-depth between the near and far planes quantised into the rest. Else
+// they are 64-bit with the depth's float bits in the low 32.
+constexpr uint32_t kMinDepthBits = 14;
+
+struct KeyLayout
+{
+    uint32_t image_bits;
+    uint32_t tile_bits;
+    uint32_t depth_bits;
+    bool compact; // uint32 keys (stored as int32), else int64
+};
+
+inline KeyLayout key_layout(int64_t n_images, int64_t n_tiles)
+{
+    const uint32_t image_bits = bits_for_count(n_images);
+    const uint32_t tile_bits  = bits_for_count(n_tiles);
+    const bool compact        = image_bits + tile_bits + kMinDepthBits <= 32;
+    // capped at 24: past that the float log-depth has no more precision to give
+    return {image_bits, tile_bits, compact ? std::min(32 - image_bits - tile_bits, 24u) : 32, compact};
+}
+
+// One entry per (gaussian, tile) overlap; flatten_ids points each entry back
+// at its gaussian row (dense: image * N + gaussian, packed: the packed row).
 struct TileIntersectResult
 {
-    at::Tensor isect_ids;   // [n_isects] int64
+    at::Tensor isect_ids;   // [n_isects] int32 (compact) or int64
     at::Tensor flatten_ids; // [n_isects] int32
 };
 
@@ -52,6 +77,8 @@ TileIntersectResult intersect_tile(
     int64_t tile_size,
     int64_t tile_width,
     int64_t tile_height,
+    double near_plane, // depth range of compact keys
+    double far_plane,
     StageTimer *timer = nullptr
 );
 
@@ -71,6 +98,8 @@ void launch_intersect_tile_kernel(
     const uint32_t tile_size,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const float near_plane,
+    const float far_plane,
     const at::optional<at::Tensor> cum_tiles_per_gauss, // [..., N] or [nnz]
     // outputs
     at::optional<at::Tensor> tiles_per_gauss, // [..., N] or [nnz]
@@ -90,8 +119,7 @@ void launch_intersect_offset_kernel(
 
 void radix_sort_double_buffer(
     const int64_t n_isects,
-    const uint32_t image_n_bits,
-    const uint32_t tile_n_bits,
+    const KeyLayout &layout,
     at::Tensor isect_ids,
     at::Tensor flatten_ids,
     at::Tensor isect_ids_sorted,

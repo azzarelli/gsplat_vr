@@ -22,7 +22,8 @@
 //   2. colour       SH -> RGB per visible entry, +0.5 and clamp; optional
 //                   depth appended as the last feature channel
 //   3. intersect    one (image|tile|depth) key per gaussian-tile overlap,
-//                   radix sorted, then per-tile start offsets
+//                   32-bit when it fits (see key_layout), radix sorted,
+//                   then per-tile start offsets
 //   4. rasterize    front-to-back alpha compositing per tile; ED divides the
 //                   depth by alpha as each pixel is written. Writes tensors,
 //                   or straight into CUDA arrays (e.g. mapped GL textures)
@@ -365,6 +366,8 @@ RasterizationOutputs rasterization_3dgs(
         tile_size,
         tile_width,
         tile_height,
+        near_plane,
+        far_plane,
         &timer
     );
     at::Tensor isect_offsets = intersect_offset(isects.isect_ids, C, tile_width, tile_height);
