@@ -50,8 +50,9 @@ namespace
 {
     void check_inputs(
         const at::Tensor &means,
-        const at::Tensor &quats,
-        const at::Tensor &scales,
+        const at::optional<at::Tensor> &quats,
+        const at::optional<at::Tensor> &scales,
+        const at::optional<at::Tensor> &covars,
         const at::Tensor &opacities,
         const at::optional<at::Tensor> &colors,
         const at::Tensor &viewmats,
@@ -64,8 +65,16 @@ namespace
     {
         TORCH_CHECK(means.dim() == 2 && means.size(1) == 3, "means must be [N, 3], got ", means.sizes());
         const int64_t N = means.size(0);
-        TORCH_CHECK(quats.sizes() == at::IntArrayRef({N, 4}), "quats must be [N, 4], got ", quats.sizes());
-        TORCH_CHECK(scales.sizes() == at::IntArrayRef({N, 3}), "scales must be [N, 3], got ", scales.sizes());
+        if(covars.has_value())
+        {
+            TORCH_CHECK(covars->sizes() == at::IntArrayRef({N, 6}), "covars must be [N, 6], got ", covars->sizes());
+        }
+        else
+        {
+            TORCH_CHECK(quats.has_value() && scales.has_value(), "need covars, or quats and scales");
+            TORCH_CHECK(quats->sizes() == at::IntArrayRef({N, 4}), "quats must be [N, 4], got ", quats->sizes());
+            TORCH_CHECK(scales->sizes() == at::IntArrayRef({N, 3}), "scales must be [N, 3], got ", scales->sizes());
+        }
         TORCH_CHECK(opacities.sizes() == at::IntArrayRef({N}), "opacities must be [N], got ", opacities.sizes());
         TORCH_CHECK(
             viewmats.dim() == 3 && viewmats.size(1) == 4 && viewmats.size(2) == 4,
@@ -198,8 +207,9 @@ namespace
 
 RasterizationOutputs rasterization_3dgs(
     const at::Tensor &means,
-    const at::Tensor &quats,
-    const at::Tensor &scales,
+    const at::optional<at::Tensor> &quats,
+    const at::optional<at::Tensor> &scales,
+    const at::optional<at::Tensor> &covars,
     const at::Tensor &opacities,
     const at::optional<at::Tensor> &colors,
     const at::Tensor &viewmats,
@@ -228,6 +238,7 @@ RasterizationOutputs rasterization_3dgs(
         means,
         quats,
         scales,
+        covars,
         opacities,
         colors,
         viewmats,
@@ -248,7 +259,7 @@ RasterizationOutputs rasterization_3dgs(
     if(packed)
     {
         ProjectionPackedResult p = projection_ewa_3dgs_packed(
-            means, quats, scales, opacities, viewmats, Ks, image_width, image_height, eps2d, near_plane, far_plane, radius_clip,
+            means, quats, scales, covars, opacities, viewmats, Ks, image_width, image_height, eps2d, near_plane, far_plane, radius_clip,
             antialiased,
             shared_sh
         );
@@ -266,7 +277,7 @@ RasterizationOutputs rasterization_3dgs(
     else
     {
         ProjectionDenseResult p = projection_ewa_3dgs_fused(
-            means, quats, scales, opacities, viewmats, Ks, image_width, image_height, eps2d, near_plane, far_plane, radius_clip,
+            means, quats, scales, covars, opacities, viewmats, Ks, image_width, image_height, eps2d, near_plane, far_plane, radius_clip,
             antialiased
         );
         radii          = p.radii;

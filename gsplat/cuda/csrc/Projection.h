@@ -38,8 +38,9 @@ struct ProjectionDenseResult
 
 ProjectionDenseResult projection_ewa_3dgs_fused(
     const at::Tensor &means,     // [..., N, 3]
-    const at::Tensor &quats,     // [..., N, 4]
-    const at::Tensor &scales,    // [..., N, 3]
+    const at::optional<at::Tensor> &quats,  // [..., N, 4], or covars
+    const at::optional<at::Tensor> &scales, // [..., N, 3], or covars
+    const at::optional<at::Tensor> &covars, // [..., N, 6] (xx, xy, xz, yy, yz, zz)
     const at::Tensor &opacities, // [..., N]
     const at::Tensor &viewmats,  // [..., C, 4, 4]
     const at::Tensor &Ks,        // [..., C, 3, 3]
@@ -73,8 +74,9 @@ struct ProjectionPackedResult
 
 ProjectionPackedResult projection_ewa_3dgs_packed(
     const at::Tensor &means,     // [N, 3]
-    const at::Tensor &quats,     // [N, 4]
-    const at::Tensor &scales,    // [N, 3]
+    const at::optional<at::Tensor> &quats,  // [N, 4], or covars
+    const at::optional<at::Tensor> &scales, // [N, 3], or covars
+    const at::optional<at::Tensor> &covars, // [N, 6] (xx, xy, xz, yy, yz, zz)
     const at::Tensor &opacities, // [N]
     const at::Tensor &viewmats,  // [C, 4, 4], C <= 4
     const at::Tensor &Ks,        // [C, 3, 3]
@@ -117,8 +119,8 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel(
 void launch_projection_ewa_3dgs_packed_kernel(
     const at::Tensor means,
     const at::optional<at::Tensor> covars, // [N, 6] optional, else quats + scales
-    const at::Tensor quats,
-    const at::Tensor scales,
+    const at::optional<at::Tensor> quats,
+    const at::optional<at::Tensor> scales,
     const at::Tensor opacities,
     const at::Tensor viewmats,
     const at::Tensor Ks,

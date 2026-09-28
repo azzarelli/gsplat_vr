@@ -35,8 +35,9 @@ using RasterizationOutputs = std::tuple<at::Tensor, at::Tensor, int64_t, int64_t
 // rasterize. See gsplat/rendering.py for the argument semantics.
 RasterizationOutputs rasterization_3dgs(
     const at::Tensor &means,                // [N, 3]
-    const at::Tensor &quats,                // [N, 4]
-    const at::Tensor &scales,               // [N, 3]
+    const at::optional<at::Tensor> &quats,  // [N, 4], or covars
+    const at::optional<at::Tensor> &scales, // [N, 3], or covars
+    const at::optional<at::Tensor> &covars, // [N, 6] (xx, xy, xz, yy, yz, zz)
     const at::Tensor &opacities,            // [N]
     const at::optional<at::Tensor> &colors, // SH [N, K, D], or colours [N, D] / [C, N, D]; none for depth-only
     const at::Tensor &viewmats,             // [C, 4, 4]

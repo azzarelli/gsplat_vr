@@ -29,16 +29,27 @@ namespace
 {
     void check_projection_inputs(
         const at::Tensor &means,
-        const at::Tensor &quats,
-        const at::Tensor &scales,
+        const at::optional<at::Tensor> &quats,
+        const at::optional<at::Tensor> &scales,
+        const at::optional<at::Tensor> &covars,
         const at::Tensor &opacities,
         const at::Tensor &viewmats,
         const at::Tensor &Ks
     )
     {
         CHECK_INPUT(means);
-        CHECK_INPUT(quats);
-        CHECK_INPUT(scales);
+        TORCH_CHECK(
+            covars.has_value() || (quats.has_value() && scales.has_value()), "need covars, or quats and scales"
+        );
+        if(covars.has_value())
+        {
+            CHECK_INPUT(covars.value());
+        }
+        else
+        {
+            CHECK_INPUT(quats.value());
+            CHECK_INPUT(scales.value());
+        }
         CHECK_INPUT(opacities);
         CHECK_INPUT(viewmats);
         CHECK_INPUT(Ks);
@@ -47,8 +58,9 @@ namespace
 
 ProjectionDenseResult projection_ewa_3dgs_fused(
     const at::Tensor &means,
-    const at::Tensor &quats,
-    const at::Tensor &scales,
+    const at::optional<at::Tensor> &quats,
+    const at::optional<at::Tensor> &scales,
+    const at::optional<at::Tensor> &covars,
     const at::Tensor &opacities,
     const at::Tensor &viewmats,
     const at::Tensor &Ks,
@@ -62,7 +74,7 @@ ProjectionDenseResult projection_ewa_3dgs_fused(
 )
 {
     DEVICE_GUARD(means);
-    check_projection_inputs(means, quats, scales, opacities, viewmats, Ks);
+    check_projection_inputs(means, quats, scales, covars, opacities, viewmats, Ks);
 
     auto opt = means.options();
     at::DimVector shape(means.sizes().slice(0, means.dim() - 2)); // batch dims
@@ -86,9 +98,9 @@ ProjectionDenseResult projection_ewa_3dgs_fused(
 
     launch_projection_ewa_3dgs_fused_fwd_kernel(
         means,
-        c10::nullopt, // covars
-        quats,
-        scales,
+        covars,
+        covars.has_value() ? c10::nullopt : quats,
+        covars.has_value() ? c10::nullopt : scales,
         opacities,
         viewmats,
         Ks,
@@ -110,8 +122,9 @@ ProjectionDenseResult projection_ewa_3dgs_fused(
 
 ProjectionPackedResult projection_ewa_3dgs_packed(
     const at::Tensor &means,
-    const at::Tensor &quats,
-    const at::Tensor &scales,
+    const at::optional<at::Tensor> &quats,
+    const at::optional<at::Tensor> &scales,
+    const at::optional<at::Tensor> &covars,
     const at::Tensor &opacities,
     const at::Tensor &viewmats,
     const at::Tensor &Ks,
@@ -126,7 +139,7 @@ ProjectionPackedResult projection_ewa_3dgs_packed(
 )
 {
     DEVICE_GUARD(means);
-    check_projection_inputs(means, quats, scales, opacities, viewmats, Ks);
+    check_projection_inputs(means, quats, scales, covars, opacities, viewmats, Ks);
     TORCH_CHECK(means.dim() == 2 && viewmats.dim() == 3, "packed projection takes means [N, 3] and viewmats [C, 4, 4]");
     TORCH_CHECK(means.scalar_type() == at::kFloat, "packed projection is float32 only");
 
@@ -139,9 +152,9 @@ ProjectionPackedResult projection_ewa_3dgs_packed(
     {
         launch_projection_ewa_3dgs_packed_kernel(
             means,
-            c10::nullopt, // covars
-            quats,
-            scales,
+            covars,
+            covars.has_value() ? c10::nullopt : quats,
+            covars.has_value() ? c10::nullopt : scales,
             opacities,
             viewmats,
             Ks,

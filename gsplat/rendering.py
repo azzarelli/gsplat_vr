@@ -27,8 +27,8 @@ _STAGES = ("project", "sh", "isect", "sort", "blend")
 
 def rasterization(
     means: Tensor,  # [N, 3]
-    quats: Tensor,  # [N, 4] (w, x, y, z), normalised in the kernel
-    scales: Tensor,  # [N, 3]
+    quats: Optional[Tensor],  # [N, 4] (w, x, y, z), normalised in the kernel; None with covars
+    scales: Optional[Tensor],  # [N, 3]; None with covars
     opacities: Tensor,  # [N]
     colors: Optional[Tensor],  # SH [N, K, D] with sh_degree, else [N, D] or [C, N, D]
     viewmats: Tensor,  # [C, 4, 4] world-to-camera
@@ -48,6 +48,7 @@ def rasterization(
     stereo: bool = False,
     targets: Optional[Sequence[Tuple[int, int]]] = None,
     profile: bool = False,
+    covars: Optional[Tensor] = None,  # [N, 6] (xx, xy, xz, yy, yz, zz), replaces quats + scales
 ) -> Tuple[Optional[Tensor], Optional[Tensor], Dict]:
     """Render C views of N Gaussians. Forward only.
 
@@ -84,8 +85,9 @@ def rasterization(
 
     render_colors, render_alphas, n_entries, n_isects, stage_ms = _C.rasterization_3dgs(
         means.contiguous(),
-        quats.contiguous(),
-        scales.contiguous(),
+        None if covars is not None else quats.contiguous(),
+        None if covars is not None else scales.contiguous(),
+        covars.contiguous() if covars is not None else None,
         opacities.contiguous(),
         colors.contiguous() if has_color else None,
         viewmats.contiguous(),
