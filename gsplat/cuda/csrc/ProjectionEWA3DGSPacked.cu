@@ -87,7 +87,10 @@ __global__ void projection_ewa_3dgs_packed_kernel(
 
     CameraProjection proj[C];
     uint32_t visible = 0; // bit c: kept by camera c
-    if(gid < N)
+    // Opacity first: empty and padded pool entries are 0, and the blur
+    // compensation is <= 1, so these would be culled below anyway.
+    const float raw_opacity = gid < N ? opacities[gid] : 0.f;
+    if(raw_opacity >= ALPHA_THRESHOLD)
     {
         const vec3 mean_w = glm::make_vec3(means + gid * 3);
         mat3 covar;
@@ -136,7 +139,7 @@ __global__ void projection_ewa_3dgs_packed_kernel(
                 continue;
             }
 
-            float opacity = opacities[gid];
+            float opacity = raw_opacity;
             if(antialiased)
             {
                 opacity *= compensation;
