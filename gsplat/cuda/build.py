@@ -31,6 +31,7 @@ import torch
 import torch.utils.cpp_extension as jit
 from torch.utils.cpp_extension import CUDA_HOME
 
+IS_WINDOWS = os.name == "nt"
 PATH = os.path.dirname(os.path.abspath(__file__))
 DEBUG = os.getenv("DEBUG", "0") == "1"
 FAST_MATH = os.getenv("FAST_MATH", "1") == "1"
@@ -69,17 +70,28 @@ def get_build_parameters():
                 if os.path.isdir(os.path.join(p, "cccl")):  # CUDA >= 13
                     include_paths.append(os.path.join(p, "cccl"))
 
-    cflags = ["-std=c++20", "-Wno-attributes", "-Wno-unknown-pragmas"]
-    cflags += ["-g", "-O0"] if DEBUG else ["-O3", "-DNDEBUG"]
-    if "backend: OpenMP" in torch.__config__.parallel_info():
-        cflags += ["-DAT_PARALLEL_OPENMP", "-fopenmp"]
+    openmp = "backend: OpenMP" in torch.__config__.parallel_info()
+    if IS_WINDOWS:
+        # MSVC rejects the gcc-style flags below, and nvcc forwards unknown
+        # options to cl, so both compilers get MSVC spellings here.
+        cflags = ["/std:c++20", "/Zc:__cplusplus"]
+        cflags += ["/Od", "/Zi"] if DEBUG else ["/O2", "/DNDEBUG"]
+        cflags += ["/DAT_PARALLEL_OPENMP", "/openmp"] if openmp else []
+        host_cflags = ["-std=c++20", "-Xcompiler", "/Zc:__cplusplus"]
+        host_cflags += ["-g", "-O0"] if DEBUG else ["-O3", "-DNDEBUG"]
+        host_cflags += ["-DAT_PARALLEL_OPENMP", "-Xcompiler", "/openmp"] if openmp else []
+    else:
+        cflags = ["-std=c++20", "-Wno-attributes", "-Wno-unknown-pragmas"]
+        cflags += ["-g", "-O0"] if DEBUG else ["-O3", "-DNDEBUG"]
+        cflags += ["-DAT_PARALLEL_OPENMP", "-fopenmp"] if openmp else []
+        host_cflags = cflags
 
     cuda_cflags = ["--forward-unknown-opts", "--expt-relaxed-constexpr"]
     cuda_cflags += ["-use_fast_math"] if FAST_MATH else []
     cuda_cflags += ["-lineinfo"] if WITH_SYMBOLS else []
     # 3189: C++20 `module` keyword vs torch::python::module; 20012/186: glm noise.
     cuda_cflags += ["-diag-suppress", "3189,20012,186"]
-    cuda_cflags += cflags
+    cuda_cflags += host_cflags
     if NUM_CHANNELS is not None:
         # nvcc needs the commas escaped; gcc does not.
         cuda_cflags += ["-DGSPLAT_NUM_CHANNELS=" + NUM_CHANNELS.replace(",", "\\,")]
@@ -92,7 +104,8 @@ def get_build_parameters():
         sources=[os.path.join(PATH, s) for s in SOURCES],
         extra_cflags=cflags,
         extra_cuda_cflags=cuda_cflags,
-        extra_ldflags=[] if WITH_SYMBOLS else ["-s"],
+        # -s is a gcc/ld strip flag; link.exe does not strip.
+        extra_ldflags=[] if WITH_SYMBOLS or IS_WINDOWS else ["-s"],
     )
 
 
@@ -126,7 +139,8 @@ def build_and_load_gsplat():
     with open(params_file, "w") as f:
         json.dump(params.__dict__, f)
 
-    fresh = not os.path.exists(os.path.join(build_dir, f"{params.name}.so"))
+    ext = ".pyd" if IS_WINDOWS else ".so"
+    fresh = not os.path.exists(os.path.join(build_dir, f"{params.name}{ext}"))
     if fresh:
         print(f"gsplat: compiling CUDA extension in {build_dir}")
     tic = time.time()
