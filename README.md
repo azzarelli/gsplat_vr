@@ -1,24 +1,12 @@
 # gsplat (stereo-lean)
 
 A forward-only trim of [gsplat](https://github.com/nerfstudio-project/gsplat)
-1.6.0 trunk, kept to what real-time stereo rendering of 3DGS needs. The full
-library (training, backward passes, 2DGS, 3DGUT, lidar, sparse, multi-GPU)
-is on the `uwgs-fork` branch.
+1.6.0 trunk, keeping only whats necessary for rasterizing 3D-GS representations that are rendered out as GL_Textures. 
 
-Output is bit-identical to `uwgs-fork` for the kept paths.
+- Some shortcuts have been made to render to VR headsets (2x 4k images, left and right)
+- The changes are mostly to do with hand-offs with moderngl and handling simplifications by pre-baking paramters that don't require back-prop so their use can be binned for pre-built or built-on-init parameters.
+- Much faster than [gsplat](https://github.com/nerfstudio-project/gsplat) and [VRSplat](https://github.com/Cekavis/VRSplat); for an average 7mil in-frustum render load, on a 4090, for 2x 4K RGB+D+A renders: gsplat1.6.0=(24.18ms+-4ms), VRSplat=(42.56ms+-5ms) and Ours=(13.48ms+-1ms).
 
-## API
-
-```python
-from gsplat import rasterization
-
-colors, alphas, meta = rasterization(
-    means, quats, scales, opacities, sh,  # [N,3] [N,4] [N,3] [N] [N,K,3]
-    viewmats, Ks, width, height,          # [C,4,4] [C,3,3]
-    sh_degree=3, render_mode="RGB+ED",
-    packed=True, stereo=True,             # stereo: shared SH for C == 2
-)
-```
 
 ## Pipeline
 
