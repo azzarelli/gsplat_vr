@@ -1,8 +1,9 @@
-# gsplat (stereo-lean)
+# Stripped gsplat for VR (AVP headsets)
 
 A forward-only trim of [gsplat](https://github.com/nerfstudio-project/gsplat)
 1.6.0 trunk, keeping only whats necessary for rasterizing 3D-GS representations that are rendered out as GL_Textures. 
 
+- No backprop; this work is purely an efficiency-first (heavy) mod of gsplat for high-res and high-FPS VR headsets 
 - Some shortcuts have been made to render to VR headsets (2x 4k images, left and right)
 - The changes are mostly to do with hand-offs with moderngl and handling simplifications by pre-baking paramters that don't require back-prop so their use can be binned for pre-built or built-on-init parameters.
 - Much faster than [gsplat](https://github.com/nerfstudio-project/gsplat) and [VRSplat](https://github.com/Cekavis/VRSplat); for an average 7mil in-frustum render load, on a 4090, for 2x 4K RGB+D+A renders: gsplat1.6.0=(24.18ms+-4ms), VRSplat=(42.56ms+-5ms) and Ours=(13.48ms+-1ms).
