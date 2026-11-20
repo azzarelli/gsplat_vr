@@ -19,6 +19,7 @@
 #include <torch/extension.h>
 
 #include "csrc/Rendering.h"
+#include "csrc/SegmentRows.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -29,5 +30,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         &gsplat::rasterization_3dgs,
         py::call_guard<py::gil_scoped_release>(),
         "Project, colour, sort and rasterize 3D Gaussians for C cameras."
+    );
+    m.def(
+        "segment_rows",
+        &gsplat::segment_rows,
+        "Rows of the kept segments, ascending, then fill: an indices list for rasterization_3dgs."
     );
 }

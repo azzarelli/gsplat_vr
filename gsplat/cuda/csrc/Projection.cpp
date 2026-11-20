@@ -135,7 +135,8 @@ ProjectionPackedResult projection_ewa_3dgs_packed(
     double far_plane,
     double radius_clip,
     bool antialiased,
-    bool with_union
+    bool with_union,
+    const at::optional<at::Tensor> &indices
 )
 {
     DEVICE_GUARD(means);
@@ -143,7 +144,8 @@ ProjectionPackedResult projection_ewa_3dgs_packed(
     TORCH_CHECK(means.dim() == 2 && viewmats.dim() == 3, "packed projection takes means [N, 3] and viewmats [C, 4, 4]");
     TORCH_CHECK(means.scalar_type() == at::kFloat, "packed projection is float32 only");
 
-    const int64_t N         = means.size(0);
+    // With indices, the kernel runs over those rows only.
+    const int64_t N         = indices.has_value() ? indices->size(0) : means.size(0);
     const int64_t C         = viewmats.size(0);
     const int64_t n_blocks  = (N + N_THREADS_PACKED - 1) / N_THREADS_PACKED;
     const int64_t cam_cells = C * n_blocks;
@@ -168,7 +170,8 @@ ProjectionPackedResult projection_ewa_3dgs_packed(
             with_union,
             cnts,
             accum,
-            out
+            out,
+            indices
         );
     };
 

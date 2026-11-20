@@ -49,7 +49,8 @@ namespace
 // each entry's slot in the union.
 template<uint32_t C>
 __global__ void projection_ewa_3dgs_packed_kernel(
-    const uint32_t N,
+    const uint32_t N,                    // rows to project: len(indices), else all
+    const int32_t *__restrict__ indices, // [N] optional: row of thread t is indices[t]
     const float *__restrict__ means,     // [N, 3]
     const float *__restrict__ covars,    // [N, 6] optional, else quats + scales
     const float *__restrict__ quats,     // [N, 4]
@@ -82,14 +83,16 @@ __global__ void projection_ewa_3dgs_packed_kernel(
 )
 {
     const uint32_t n_blocks = gridDim.x;
-    const uint32_t gid      = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t        = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool in_range     = t < N;
+    const uint32_t gid      = indices == nullptr ? t : (in_range ? static_cast<uint32_t>(indices[t]) : 0u);
     const bool first_pass   = block_cnts != nullptr;
 
     CameraProjection proj[C];
     uint32_t visible = 0; // bit c: kept by camera c
     // Opacity first: empty and padded pool entries are 0, and the blur
     // compensation is <= 1, so these would be culled below anyway.
-    const float raw_opacity = gid < N ? opacities[gid] : 0.f;
+    const float raw_opacity = in_range ? opacities[gid] : 0.f;
     if(raw_opacity >= ALPHA_THRESHOLD)
     {
         const vec3 mean_w = glm::make_vec3(means + gid * 3);
@@ -277,10 +280,11 @@ void launch_projection_ewa_3dgs_packed_kernel(
     const bool with_union,
     at::optional<at::Tensor> block_cnts,
     at::optional<at::Tensor> block_accum,
-    const ProjectionPackedResult *out
+    const ProjectionPackedResult *out,
+    const at::optional<at::Tensor> indices
 )
 {
-    const uint32_t N = means.size(0);
+    const uint32_t N = indices.has_value() ? indices->size(0) : means.size(0);
     const uint32_t C = viewmats.size(0);
     if(N == 0)
     {
@@ -296,6 +300,7 @@ void launch_projection_ewa_3dgs_packed_kernel(
             projection_ewa_3dgs_packed_kernel<CamConst::value>
                 <<<n_blocks, N_THREADS_PACKED, 0, at::cuda::getCurrentCUDAStream()>>>(
                     N,
+                    indices.has_value() ? indices.value().const_data_ptr<int32_t>() : nullptr,
                     means.const_data_ptr<float>(),
                     covars.has_value() ? covars.value().const_data_ptr<float>() : nullptr,
                     quats.has_value() ? quats.value().const_data_ptr<float>() : nullptr,

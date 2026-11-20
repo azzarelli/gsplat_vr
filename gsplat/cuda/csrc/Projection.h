@@ -87,7 +87,8 @@ ProjectionPackedResult projection_ewa_3dgs_packed(
     double far_plane,
     double radius_clip,
     bool antialiased,
-    bool with_union
+    bool with_union,
+    const at::optional<at::Tensor> &indices = c10::nullopt // [M] int32 rows to project, else all N
 );
 
 void launch_projection_ewa_3dgs_fused_fwd_kernel(
@@ -134,6 +135,7 @@ void launch_projection_ewa_3dgs_packed_kernel(
     const bool with_union,
     at::optional<at::Tensor> block_cnts,
     at::optional<at::Tensor> block_accum,
-    const ProjectionPackedResult *out
+    const ProjectionPackedResult *out,
+    const at::optional<at::Tensor> indices
 );
 } // namespace gsplat

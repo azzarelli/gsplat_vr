@@ -25,6 +25,21 @@ _RENDER_MODES = ("RGB", "D", "ED", "RGB+D", "RGB+ED")
 _STAGES = ("project", "sh", "isect", "sort", "blend")
 
 
+def segment_rows(starts: Tensor, counts: Tensor, keep: Tensor, fill: int, length: int) -> Tensor:
+    """An `indices` list for rasterization() from contiguous row segments,
+    in one GPU pass and without a host sync.
+
+    starts [S] int32 (first row of each segment), counts [S] int64, keep [S]
+    bool. Returns int32 [length]: the rows of the kept segments in order
+    (start_k, start_k + 1, ... for each kept k), then `fill`. length must be
+    sum(counts), so the caller knows it without reading anything back; fill
+    should be a row the projection drops (e.g. opacity 0).
+    """
+    from .cuda._backend import _C
+
+    return _C.segment_rows(starts.contiguous(), counts.contiguous(), keep.contiguous(), int(fill), int(length))
+
+
 def rasterization(
     means: Tensor,  # [N, 3]
     quats: Optional[Tensor],  # [N, 4] (w, x, y, z), normalised in the kernel; None with covars
@@ -49,6 +64,7 @@ def rasterization(
     targets: Optional[Sequence[Tuple[int, int]]] = None,
     profile: bool = False,
     covars: Optional[Tensor] = None,  # [N, 6] (xx, xy, xz, yy, yz, zz), replaces quats + scales
+    indices: Optional[Tensor] = None,  # [M] int32, ascending: project only these rows (packed only)
 ) -> Tuple[Optional[Tensor], Optional[Tensor], Dict]:
     """Render C views of N Gaussians. Forward only.
 
@@ -74,6 +90,9 @@ def rasterization(
     radius_clip: cull gaussians whose projected radius is at most this (px).
     eps2d: added to the 2D covariance diagonal (low-pass filter).
     tile_size: 16, or 4.
+    indices: packed only. Rows of means/covars/... to project, int32 and
+        ascending; the rest are skipped as if culled. For callers that know
+        some rows cannot be visible (e.g. off-screen cells, empty pool slots).
     """
     if render_mode not in _RENDER_MODES:
         raise ValueError(f"render_mode must be one of {_RENDER_MODES}, got {render_mode!r}")
@@ -109,6 +128,7 @@ def rasterization(
         [c for c, _ in targets] if targets else [],
         [a for _, a in targets] if targets else [],
         profile,
+        indices.contiguous() if indices is not None else None,
     )
 
     meta = {

@@ -230,7 +230,8 @@ RasterizationOutputs rasterization_3dgs(
     bool stereo,
     const std::vector<int64_t> &color_targets,
     const std::vector<int64_t> &alpha_targets,
-    bool profile
+    bool profile,
+    const at::optional<at::Tensor> &indices
 )
 {
     DEVICE_GUARD(means);
@@ -250,6 +251,12 @@ RasterizationOutputs rasterization_3dgs(
     );
     const int64_t N = means.size(0);
     const int64_t C = viewmats.size(0);
+    TORCH_CHECK(!indices.has_value() || packed, "indices need packed=True");
+    if(indices.has_value())
+    {
+        TORCH_CHECK(indices->is_cuda() && indices->scalar_type() == at::kInt && indices->dim() == 1,
+                    "indices must be a 1D int32 CUDA tensor");
+    }
     StageTimer timer(profile);
 
     // --- 1. Project ----------------------------------------------------------
@@ -261,7 +268,8 @@ RasterizationOutputs rasterization_3dgs(
         ProjectionPackedResult p = projection_ewa_3dgs_packed(
             means, quats, scales, covars, opacities, viewmats, Ks, image_width, image_height, eps2d, near_plane, far_plane, radius_clip,
             antialiased,
-            shared_sh
+            shared_sh,
+            indices
         );
         batch_ids      = p.batch_ids; // all 0: one scene, no batch dims
         camera_ids     = p.camera_ids;

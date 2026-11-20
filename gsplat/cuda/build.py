@@ -53,6 +53,7 @@ SOURCES = [
     "csrc/IntersectTile.cu",
     "csrc/Rasterization.cpp",
     "csrc/RasterizeToPixels3DGSSerialBatchFwd.cu",
+    "csrc/SegmentRows.cu",  # indices for rasterization() from row segments
 ]
 
 

@@ -58,6 +58,7 @@ RasterizationOutputs rasterization_3dgs(
     bool stereo,
     const std::vector<int64_t> &color_targets, // CUDA array handles per camera: RGBA32F (RGB + depth)
     const std::vector<int64_t> &alpha_targets, // and R32F; empty -> return tensors
-    bool profile
+    bool profile,
+    const at::optional<at::Tensor> &indices // [M] int32 ascending rows to project (packed only)
 );
 } // namespace gsplat
